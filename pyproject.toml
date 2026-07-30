@@ -1,0 +1,9 @@
+[project]
+name = "bosspilot"
+version = "0.1.0"
+description = "BOSS recruitment outreach assistant powered by DrissionPage"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "DrissionPage>=4.1,<5",
+]
