@@ -5,14 +5,15 @@ import json
 import re
 import sys
 import time
+from base64 import b64encode
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
 from DrissionPage import Chromium, ChromiumOptions
-from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QDir, QSettings, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -21,7 +22,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -91,6 +92,12 @@ EDUCATION_LEVELS = {
     "博士": 6,
 }
 CARD_SELECTORS = ".job-card-wrapper, .job-card-box, li.job-card-wrapper"
+# 结果表“沟通状态”列的配色，未列出的状态按告警色显示。
+CONTACT_STATUS_COLORS = {
+    "已发起沟通": "#0f7a58",
+    "此前已沟通": "#5a6b7b",
+    "未沟通": "#8b98a5",
+}
 PROJECT_DIR = Path(__file__).resolve().parent
 USER_DATA_PATH = PROJECT_DIR / "user_data"
 CONTACT_HISTORY_PATH = PROJECT_DIR / "data" / "contact_history.jsonl"
@@ -297,6 +304,7 @@ def append_contact_history(
 class JobWorker(QThread):
     job_found = Signal(object)
     status_changed = Signal(str)
+    stats_changed = Signal(int, int, int)  # 已读取、已匹配、已沟通
     failed = Signal(str)
     completed = Signal(int)
     log_message = Signal(str)
@@ -335,6 +343,7 @@ class JobWorker(QThread):
 
             seen: set[str] = set()
             matched = 0
+            contacted = 0
             unchanged_rounds = 0
             previous_count = 0
             self.log_message.emit(
@@ -361,6 +370,7 @@ class JobWorker(QThread):
                     if identity in seen:
                         continue
                     seen.add(identity)
+                    self.stats_changed.emit(len(seen), matched, contacted)
                     raw_display = raw_salary.encode("unicode_escape").decode("ascii")
                     self.log_message.emit(
                         f"[读取] 岗位={job.title!r} | 薪资原文={raw_display!r} | "
@@ -392,6 +402,9 @@ class JobWorker(QThread):
                                 self.log_message.emit(f"[记录失败] {exc}")
                     self.job_found.emit(job)
                     matched += 1
+                    if job.contact_status in {"已发起沟通", "此前已沟通"}:
+                        contacted += 1
+                    self.stats_changed.emit(len(seen), matched, contacted)
                     if matched >= self.options.max_results:
                         break
                     if self.options.auto_contact and job.contact_status == "已发起沟通":
@@ -532,13 +545,47 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("root")
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(24, 20, 24, 24)
-        layout.setSpacing(14)
+        layout.setContentsMargins(22, 18, 22, 20)
+        layout.setSpacing(12)
 
+        layout.addLayout(self._build_header())
+        layout.addWidget(self._build_filters())
+        self.filters_summary = QLabel()
+        self.filters_summary.setObjectName("filtersSummary")
+        self.filters_summary.setWordWrap(True)
+        self.filters_summary.hide()
+        layout.addWidget(self.filters_summary)
+        layout.addLayout(self._build_actions())
+        layout.addWidget(self._build_status())
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setObjectName("mainSplitter")
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._build_results())
+        split.addWidget(self._build_console())
+        split.setStretchFactor(0, 4)
+        split.setStretchFactor(1, 1)
+        split.setSizes([540, 140])
+        self.main_splitter = split
+        layout.addWidget(split, 1)
+        self.setCentralWidget(root)
+
+        self.login_button.clicked.connect(self.open_login)
+        self.filters_toggle.toggled.connect(self._set_filters_collapsed)
+        self.salary_mode.currentTextChanged.connect(self._sync_salary_enabled)
+        self._sync_salary_enabled(self.salary_mode.currentText())
+        self.start_button.clicked.connect(self.start_search)
+        self.stop_button.clicked.connect(self.stop_search)
+        self.export_button.clicked.connect(self.export_csv)
+        self.history_button.clicked.connect(self.open_contact_history)
+        self.clear_button.clicked.connect(self.clear_results)
+        self.table.cellDoubleClicked.connect(self.open_job)
+
+    def _build_header(self) -> QHBoxLayout:
         header = QHBoxLayout()
         header.setSpacing(16)
         brand = QVBoxLayout()
-        brand.setSpacing(2)
+        brand.setSpacing(1)
         title = QLabel("BossPilot")
         title.setObjectName("title")
         subtitle = QLabel("岗位采集与筛选")
@@ -548,16 +595,18 @@ class MainWindow(QMainWindow):
         header.addLayout(brand)
         header.addStretch()
         self.filters_toggle = QPushButton("收起筛选")
+        self.filters_toggle.setObjectName("ghost")
         self.filters_toggle.setCheckable(True)
         self.filters_toggle.setToolTip("展开或收起搜索与筛选条件")
-        header.addWidget(self.filters_toggle)
-        layout.addLayout(header)
+        header.addWidget(self.filters_toggle, 0, Qt.AlignmentFlag.AlignBottom)
+        return header
 
-        self.filters = QGroupBox("搜索与筛选")
+    def _build_filters(self) -> QWidget:
+        self.filters = QFrame()
         self.filters.setObjectName("filters")
         filter_layout = QHBoxLayout(self.filters)
-        filter_layout.setContentsMargins(18, 22, 18, 16)
-        filter_layout.setSpacing(36)
+        filter_layout.setContentsMargins(20, 14, 20, 14)
+        filter_layout.setSpacing(26)
 
         self.city = QComboBox()
         self.city.addItems(CITY_CODES)
@@ -593,48 +642,76 @@ class MainWindow(QMainWindow):
         self.contact_interval.setValue(8)
         self.contact_interval.setSuffix(" 秒")
 
-        left_fields = [
-            ("地区", self.city),
-            ("搜索词", self.query),
-            ("岗位名称关键词", self.keywords),
-            ("关键词匹配", self.keyword_mode),
-            ("最多结果", self.max_results),
-            ("自动沟通", self.auto_contact),
+        groups = [
+            (
+                "搜索目标",
+                [
+                    ("地区", self.city),
+                    ("搜索词", self.query),
+                    ("岗位名称关键词", self.keywords),
+                    ("关键词匹配", self.keyword_mode),
+                ],
+            ),
+            (
+                "岗位条件",
+                [
+                    ("目标月薪", self.salary),
+                    ("薪资规则", self.salary_mode),
+                    ("我的工作经验", self.experience),
+                    ("我的学历", self.education),
+                ],
+            ),
+            (
+                "采集与沟通",
+                [
+                    ("最多结果", self.max_results),
+                    ("最多加载轮数", self.max_scrolls),
+                    ("沟通间隔", self.contact_interval),
+                    ("自动沟通", self.auto_contact),
+                ],
+            ),
         ]
-        right_fields = [
-            ("目标月薪", self.salary),
-            ("薪资规则", self.salary_mode),
-            ("我的工作经验", self.experience),
-            ("我的学历", self.education),
-            ("最多加载轮数", self.max_scrolls),
-            ("沟通间隔", self.contact_interval),
+        self.filter_controls = [
+            widget for _, rows in groups for _, widget in rows
         ]
-        for fields in (left_fields, right_fields):
+        for index, (caption, rows) in enumerate(groups):
+            if index:
+                divider = QFrame()
+                divider.setObjectName("vDivider")
+                divider.setFrameShape(QFrame.Shape.VLine)
+                filter_layout.addWidget(divider)
+            column = QVBoxLayout()
+            column.setContentsMargins(0, 0, 0, 0)
+            column.setSpacing(8)
+            group_label = QLabel(caption)
+            group_label.setObjectName("fieldGroup")
+            column.addWidget(group_label)
             form = QFormLayout()
             form.setContentsMargins(0, 0, 0, 0)
-            form.setHorizontalSpacing(16)
-            form.setVerticalSpacing(10)
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-            for label, widget in fields:
-                widget.setMinimumWidth(230)
+            form.setHorizontalSpacing(14)
+            form.setVerticalSpacing(7)
+            form.setLabelAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            form.setFieldGrowthPolicy(
+                QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            for label, widget in rows:
+                widget.setMinimumWidth(170)
                 form.addRow(label, widget)
-            filter_layout.addLayout(form, 1)
+            column.addLayout(form)
+            column.addStretch()
+            filter_layout.addLayout(column, 1)
+        return self.filters
 
-        self.filter_controls = [widget for _, widget in left_fields + right_fields]
-        layout.addWidget(self.filters)
-        self.filters_summary = QLabel()
-        self.filters_summary.setObjectName("filtersSummary")
-        self.filters_summary.setWordWrap(True)
-        self.filters_summary.hide()
-        layout.addWidget(self.filters_summary)
-
+    def _build_actions(self) -> QHBoxLayout:
         actions = QHBoxLayout()
         actions.setSpacing(8)
         self.login_button = QPushButton("登录 BOSS")
         self.start_button = QPushButton("开始采集")
         self.start_button.setObjectName("primary")
         self.stop_button = QPushButton("停止")
+        self.stop_button.setObjectName("danger")
         self.stop_button.setEnabled(False)
         self.export_button = QPushButton("导出 CSV")
         self.export_button.setEnabled(False)
@@ -642,44 +719,58 @@ class MainWindow(QMainWindow):
         self.history_button.setToolTip("打开沟通历史 JSONL 文件")
         self.clear_button = QPushButton("清空结果")
         self.clear_button.setEnabled(False)
-        actions.addWidget(self.login_button)
-        actions.addWidget(self.start_button)
-        actions.addWidget(self.stop_button)
-        actions.addWidget(self.export_button)
-        actions.addWidget(self.history_button)
-        actions.addWidget(self.clear_button)
+        for button in (
+            self.start_button,
+            self.stop_button,
+            self.login_button,
+            self.export_button,
+            self.history_button,
+            self.clear_button,
+        ):
+            actions.addWidget(button)
         actions.addStretch()
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
-        self.progress.setFixedWidth(150)
+        self.progress.setFixedWidth(160)
         self.progress.hide()
         actions.addWidget(self.progress)
-        layout.addLayout(actions)
+        return actions
 
+    def _build_status(self) -> QWidget:
         self.status_panel = QFrame()
         self.status_panel.setObjectName("statusPanel")
-        self.status_panel.setProperty("state", "neutral")
         status_layout = QHBoxLayout(self.status_panel)
-        status_layout.setContentsMargins(12, 8, 12, 8)
+        status_layout.setContentsMargins(14, 9, 14, 9)
+        status_layout.setSpacing(10)
+        self.status_dot = QLabel()
+        self.status_dot.setObjectName("statusDot")
+        self.status_dot.setFixedSize(8, 8)
         self.status = QLabel("就绪")
         self.status.setObjectName("status")
+        status_layout.addWidget(self.status_dot)
         status_layout.addWidget(self.status)
         status_layout.addStretch()
-        layout.addWidget(self.status_panel)
 
-        console_group = QGroupBox("采集控制台")
-        console_layout = QVBoxLayout(console_group)
-        console_layout.setContentsMargins(10, 16, 10, 10)
-        self.console = QPlainTextEdit()
-        self.console.setReadOnly(True)
-        self.console.setMaximumBlockCount(2000)
-        self.console.setMinimumHeight(130)
-        self.console.setMaximumHeight(220)
-        self.console.setPlaceholderText("开始采集后，这里会显示每个岗位的读取字段和筛选原因。")
-        console_layout.addWidget(self.console)
-        layout.addWidget(console_group)
+        self.stat_labels: dict[str, QLabel] = {}
+        for key, caption in (("scanned", "已读取"), ("matched", "已匹配"), ("contacted", "已沟通")):
+            chip = QFrame()
+            chip.setObjectName("statChip")
+            chip_layout = QHBoxLayout(chip)
+            chip_layout.setContentsMargins(10, 3, 10, 3)
+            chip_layout.setSpacing(6)
+            caption_label = QLabel(caption)
+            caption_label.setObjectName("statCaption")
+            value_label = QLabel("0")
+            value_label.setObjectName("statValue")
+            chip_layout.addWidget(caption_label)
+            chip_layout.addWidget(value_label)
+            status_layout.addWidget(chip)
+            self.stat_labels[key] = value_label
+        self._set_status("就绪")
+        return self.status_panel
 
+    def _build_results(self) -> QWidget:
         self.table = QTableWidget(0, len(self.HEADERS))
         self.table.setObjectName("resultsTable")
         self.table.setHorizontalHeaderLabels(self.HEADERS)
@@ -689,8 +780,10 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         self.table.setWordWrap(False)
+        self.table.setToolTip("双击任意一行可以打开岗位详情页")
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.verticalHeader().setDefaultSectionSize(42)
+        self.table.horizontalHeader().setHighlightSections(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -698,11 +791,12 @@ class MainWindow(QMainWindow):
 
         results = QFrame()
         results.setObjectName("resultsPanel")
+        results.setMinimumHeight(160)
         results_layout = QVBoxLayout(results)
-        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setContentsMargins(1, 1, 1, 1)
         results_layout.setSpacing(0)
         results_header = QHBoxLayout()
-        results_header.setContentsMargins(14, 10, 14, 10)
+        results_header.setContentsMargins(16, 12, 16, 12)
         results_title = QLabel("岗位结果")
         results_title.setObjectName("sectionTitle")
         self.result_count = QLabel("0 个结果")
@@ -719,28 +813,49 @@ class MainWindow(QMainWindow):
         empty_state = QWidget()
         empty_state.setObjectName("emptyState")
         empty_layout = QVBoxLayout(empty_state)
+        empty_layout.setSpacing(6)
         empty_layout.addStretch()
         empty_title = QLabel("暂无岗位结果")
         empty_title.setObjectName("emptyTitle")
         empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_hint = QLabel("设置好筛选条件后点击“开始采集”")
+        empty_hint.setObjectName("emptyHint")
+        empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(empty_title)
+        empty_layout.addWidget(empty_hint)
         empty_layout.addStretch()
         self.results_stack.addWidget(empty_state)
         self.results_stack.addWidget(self.table)
         results_layout.addWidget(self.results_stack, 1)
-        layout.addWidget(results, 1)
-        self.setCentralWidget(root)
+        return results
 
-        self.login_button.clicked.connect(self.open_login)
-        self.filters_toggle.toggled.connect(self._set_filters_collapsed)
-        self.salary_mode.currentTextChanged.connect(self._sync_salary_enabled)
-        self._sync_salary_enabled(self.salary_mode.currentText())
-        self.start_button.clicked.connect(self.start_search)
-        self.stop_button.clicked.connect(self.stop_search)
-        self.export_button.clicked.connect(self.export_csv)
-        self.history_button.clicked.connect(self.open_contact_history)
-        self.clear_button.clicked.connect(self.clear_results)
-        self.table.cellDoubleClicked.connect(self.open_job)
+    def _build_console(self) -> QWidget:
+        console_panel = QFrame()
+        console_panel.setObjectName("consolePanel")
+        console_layout = QVBoxLayout(console_panel)
+        console_layout.setContentsMargins(1, 1, 1, 1)
+        console_layout.setSpacing(0)
+        console_header = QHBoxLayout()
+        console_header.setContentsMargins(16, 8, 16, 8)
+        console_title = QLabel("采集控制台")
+        console_title.setObjectName("sectionTitle")
+        clear_log = QPushButton("清空日志")
+        clear_log.setObjectName("ghost")
+        clear_log.clicked.connect(lambda: self.console.clear())
+        console_header.addWidget(console_title)
+        console_header.addStretch()
+        console_header.addWidget(clear_log)
+        console_layout.addLayout(console_header)
+
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumBlockCount(2000)
+        self.console.setMinimumHeight(78)
+        self.console.setPlaceholderText(
+            "开始采集后，这里会显示每个岗位的读取字段和筛选原因。"
+        )
+        console_layout.addWidget(self.console, 1)
+        return console_panel
 
     @Slot()
     def start_search(self) -> None:
@@ -770,6 +885,7 @@ class MainWindow(QMainWindow):
         self.worker = JobWorker(options)
         self.worker.job_found.connect(self.add_job)
         self.worker.status_changed.connect(self.search_status_changed)
+        self.worker.stats_changed.connect(self.update_stats)
         self.worker.log_message.connect(self.append_log)
         self.worker.failed.connect(self.search_failed)
         self.worker.completed.connect(self.search_completed)
@@ -843,6 +959,8 @@ class MainWindow(QMainWindow):
             item.setToolTip(value)
             if column == 0:
                 item.setData(Qt.ItemDataRole.UserRole, job.link)
+            if column == len(values) - 1:
+                item.setForeground(QColor(CONTACT_STATUS_COLORS.get(value, "#b45309")))
             self.table.setItem(row, column, item)
         self.export_button.setEnabled(True)
         self._update_results_state()
@@ -866,6 +984,7 @@ class MainWindow(QMainWindow):
         self.jobs.clear()
         self.table.setRowCount(0)
         self.export_button.setEnabled(False)
+        self.update_stats(0, 0, 0)
         self._update_results_state()
 
     @Slot()
@@ -930,9 +1049,21 @@ class MainWindow(QMainWindow):
     def _set_status(self, message: str, state: str = "neutral") -> None:
         """更新状态文案与对应的视觉状态。"""
         self.status.setText(message)
-        self.status_panel.setProperty("state", state)
-        self.status_panel.style().unpolish(self.status_panel)
-        self.status_panel.style().polish(self.status_panel)
+        self.status.setToolTip(message)
+        for widget in (self.status_panel, self.status_dot):
+            widget.setProperty("state", state)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    @Slot(int, int, int)
+    def update_stats(self, scanned: int, matched: int, contacted: int) -> None:
+        """刷新状态栏上的读取、匹配与沟通计数。"""
+        for key, value in (
+            ("scanned", scanned),
+            ("matched", matched),
+            ("contacted", contacted),
+        ):
+            self.stat_labels[key].setText(str(value))
 
     @Slot(bool)
     def _set_filters_collapsed(self, collapsed: bool) -> None:
@@ -992,6 +1123,9 @@ class MainWindow(QMainWindow):
         geometry = settings.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
+        splitter_state = settings.value("window/splitter")
+        if splitter_state is not None:
+            self.main_splitter.restoreState(splitter_state)
 
     def _save_settings(self) -> None:
         settings = QSettings("BossPilot", "BossPilot")
@@ -1013,6 +1147,7 @@ class MainWindow(QMainWindow):
             settings.setValue(f"filters/{key}", value)
         settings.setValue("window/filters_collapsed", self.filters_toggle.isChecked())
         settings.setValue("window/geometry", self.saveGeometry())
+        settings.setValue("window/splitter", self.main_splitter.saveState())
         settings.sync()
 
     @Slot(int, int)
@@ -1033,45 +1168,168 @@ class MainWindow(QMainWindow):
 
 
 STYLE = """
-QWidget#root { background: #f2f5f7; color: #17212b; }
-QWidget { font-size: 13px; color: #17212b; }
-QLabel#title { font-size: 26px; font-weight: 700; color: #12202b; }
-QLabel#subtitle { color: #66727f; font-size: 13px; }
-QGroupBox#filters { border: 1px solid #d7dee5; border-radius: 6px; margin-top: 10px; background: #ffffff; font-weight: 600; }
-QGroupBox#filters::title { subcontrol-origin: margin; left: 14px; padding: 0 6px; color: #43505c; }
-QPlainTextEdit { border: 1px solid #d3dbe2; border-radius: 4px; background: #111820; color: #d9e2ea; padding: 8px; font-family: Menlo, monospace; font-size: 11px; }
-QLineEdit, QComboBox, QSpinBox { min-height: 36px; padding: 0 10px; border: 1px solid #cbd4dc; border-radius: 4px; background: #ffffff; selection-background-color: #bce3e6; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #087f8c; }
-QPushButton { min-height: 36px; padding: 0 16px; border: 1px solid #c8d1d9; border-radius: 4px; background: #ffffff; color: #33414d; font-weight: 500; }
-QPushButton:hover { background: #edf3f4; border-color: #9fb8bd; }
-QPushButton:pressed { background: #e1eaec; }
-QPushButton:disabled { color: #9aa6b1; background: #e9eef1; border-color: #d8e0e5; }
-QPushButton#primary { color: #ffffff; background: #087f8c; border-color: #087f8c; font-weight: 600; }
-QPushButton#primary:hover { background: #066c77; border-color: #066c77; }
-QFrame#statusPanel { border: 1px solid #d7e4e6; border-left: 3px solid #8eaeb3; border-radius: 4px; background: #edf5f5; }
-QFrame#statusPanel[state=running] { border-left-color: #087f8c; background: #e7f3f4; }
-QFrame#statusPanel[state=success] { border-left-color: #2e7d5a; background: #ebf6ef; }
-QFrame#statusPanel[state=error] { border-left-color: #c75c5c; background: #fbeeee; }
-QLabel#status { color: #52616d; }
-QLabel#filtersSummary { padding: 12px 14px; border: 1px solid #d7dee5; border-radius: 4px; background: #ffffff; color: #43505c; }
-QLabel#sectionTitle { font-size: 14px; font-weight: 700; color: #253541; }
-QLabel#resultCount { color: #6d7b87; }
-QFrame#resultsPanel { border: 1px solid #d7dee5; border-radius: 6px; background: #ffffff; }
-QWidget#emptyState { background: #ffffff; }
-QLabel#emptyTitle { color: #7a8792; font-size: 15px; }
-QProgressBar { border: 0; border-radius: 2px; background: #dce9eb; min-height: 5px; max-height: 5px; }
-QProgressBar::chunk { border-radius: 2px; background: #087f8c; }
-QTableWidget#resultsTable { border: 0; background: #ffffff; alternate-background-color: #f7f9fa; gridline-color: transparent; }
-QTableWidget#resultsTable::item { padding: 8px; border-bottom: 1px solid #edf0f2; }
-QTableWidget#resultsTable::item:selected { color: #17212b; background: #dff1f2; }
-QHeaderView::section { padding: 10px 8px; border: 0; border-bottom: 1px solid #d7dee5; background: #f1f4f6; color: #52616d; font-weight: 600; }
+/* 设计基准：背景 #f4f6f9，卡片 #ffffff，描边 #e2e8f0，主色 #0d7d8c。 */
+QWidget { font-size: 13px; color: #1f2a37; }
+QWidget#root { background: #f4f6f9; }
+QToolTip { padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px;
+           background: #1f2a37; color: #f8fafc; }
+
+QLabel#title { font-size: 25px; font-weight: 700; color: #0f1b26; }
+QLabel#subtitle { font-size: 12px; color: #6b7a89; }
+QLabel#sectionTitle { font-size: 14px; font-weight: 700; color: #1f2a37; }
+QLabel#fieldGroup { font-size: 11px; font-weight: 700; color: #8b98a5;
+                    letter-spacing: 1px; padding-bottom: 2px; }
+QLabel#resultCount { color: #6b7a89; }
+
+QFrame#filters, QFrame#resultsPanel, QFrame#consolePanel {
+    border: 1px solid #e2e8f0; border-radius: 10px; background: #ffffff; }
+QFrame#vDivider { border: none; border-left: 1px solid #eef2f6;
+                  max-width: 1px; margin: 22px 0 4px 0; }
+QLabel#filtersSummary { padding: 11px 14px; border: 1px solid #e2e8f0;
+                        border-radius: 10px; background: #ffffff; color: #4b5a68; }
+
+QLineEdit, QComboBox, QSpinBox {
+    min-height: 31px; padding: 0 10px; border: 1px solid #d6dee8;
+    border-radius: 8px; background: #ffffff; selection-background-color: #b8e2e7;
+    selection-color: #0f1b26; }
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover { border-color: #b6c4d2; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #0d7d8c; }
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
+    background: #f1f4f8; color: #9aa7b4; border-color: #e2e8f0; }
+QComboBox::drop-down { width: 22px; border: none; }
+QComboBox QAbstractItemView { border: 1px solid #d6dee8; border-radius: 8px;
+    background: #ffffff; outline: none; selection-background-color: #e6f3f4;
+    selection-color: #0f1b26; padding: 4px; }
+QSpinBox::up-button, QSpinBox::down-button { width: 20px; height: 13px;
+    border: none; background: transparent; subcontrol-origin: border; }
+QSpinBox::up-button { subcontrol-position: top right; margin: 4px 5px 0 0; }
+QSpinBox::down-button { subcontrol-position: bottom right; margin: 0 5px 4px 0; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #eef3f7;
+                                                        border-radius: 3px; }
+QCheckBox { spacing: 8px; min-height: 31px; color: #1f2a37; }
+QCheckBox::indicator { width: 17px; height: 17px; border: 1px solid #c3cedb;
+    border-radius: 5px; background: #ffffff; }
+QCheckBox::indicator:hover { border-color: #0d7d8c; }
+QCheckBox::indicator:checked { border-color: #0d7d8c; background: #0d7d8c; }
+
+QPushButton { min-height: 34px; padding: 0 15px; border: 1px solid #d6dee8;
+    border-radius: 8px; background: #ffffff; color: #33414d; font-weight: 500; }
+QPushButton:hover { background: #f2f6f9; border-color: #b6c4d2; }
+QPushButton:pressed { background: #e7edf3; }
+QPushButton:disabled { color: #a5b0bc; background: #f1f4f8; border-color: #e6ebf1; }
+QPushButton#primary { color: #ffffff; background: #0d7d8c; border-color: #0d7d8c;
+                      font-weight: 600; padding: 0 22px; }
+QPushButton#primary:hover { background: #0b6b78; border-color: #0b6b78; }
+QPushButton#primary:pressed { background: #095a65; }
+QPushButton#primary:disabled { color: #ffffff; background: #a8ccd1;
+                               border-color: #a8ccd1; }
+QPushButton#danger { color: #b4403f; border-color: #edc9c8; background: #fdf5f5; }
+QPushButton#danger:hover { background: #fbe9e8; border-color: #e0a7a6; }
+QPushButton#danger:disabled { color: #c0aeae; background: #f5f0f0;
+                              border-color: #ece2e2; }
+QPushButton#ghost { border-color: transparent; background: transparent;
+                    color: #5a6b7b; padding: 0 10px; min-height: 28px; }
+QPushButton#ghost:hover { background: #eaf0f5; color: #1f2a37; }
+
+QFrame#statusPanel { border: 1px solid #e2e8f0; border-radius: 10px;
+                     background: #ffffff; }
+QFrame#statusPanel[state="running"] { border-color: #b9dce1; background: #f2fafb; }
+QFrame#statusPanel[state="success"] { border-color: #b6ddc9; background: #f3fbf6; }
+QFrame#statusPanel[state="error"] { border-color: #eec6c5; background: #fdf5f5; }
+QLabel#statusDot { border-radius: 4px; background: #a5b0bc; }
+QLabel#statusDot[state="running"] { background: #0d7d8c; }
+QLabel#statusDot[state="success"] { background: #12805c; }
+QLabel#statusDot[state="error"] { background: #c2504e; }
+QLabel#status { color: #4b5a68; }
+QFrame#statChip { border: 1px solid #e6ebf1; border-radius: 11px;
+                  background: #f7f9fc; }
+QLabel#statCaption { color: #8b98a5; font-size: 11px; }
+QLabel#statValue { color: #1f2a37; font-size: 12px; font-weight: 700; }
+
+QProgressBar { border: 0; border-radius: 3px; background: #dde8ea;
+               min-height: 6px; max-height: 6px; }
+QProgressBar::chunk { border-radius: 3px; background: #0d7d8c; }
+
+QWidget#emptyState { background: #ffffff; border-bottom-left-radius: 10px;
+                     border-bottom-right-radius: 10px; }
+QLabel#emptyTitle { color: #5a6b7b; font-size: 15px; font-weight: 600; }
+QLabel#emptyHint { color: #9aa7b4; font-size: 12px; }
+
+QTableWidget#resultsTable { border: 0; background: #ffffff;
+    alternate-background-color: #fafbfd; gridline-color: transparent;
+    outline: none; }
+QTableWidget#resultsTable::item { padding: 8px 10px;
+    border-bottom: 1px solid #f0f3f7; }
+QTableWidget#resultsTable::item:selected { color: #0f1b26; background: #e2f2f4; }
+QHeaderView::section { padding: 10px; border: 0; border-bottom: 1px solid #e2e8f0;
+    background: #f7f9fc; color: #6b7a89; font-weight: 600; }
+
+QPlainTextEdit { border: 0; border-top: 1px solid #e2e8f0;
+    border-bottom-left-radius: 10px; border-bottom-right-radius: 10px;
+    background: #16202b; color: #cdd9e4; padding: 10px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px;
+    selection-background-color: #2f4b5a; }
+
+QSplitter#mainSplitter::handle { background: transparent; height: 10px; }
+QScrollBar:vertical { width: 10px; background: transparent; margin: 0; }
+QScrollBar::handle:vertical { min-height: 30px; border-radius: 5px;
+                              background: #cdd6e0; }
+QScrollBar::handle:vertical:hover { background: #b6c4d2; }
+QScrollBar:horizontal { height: 10px; background: transparent; margin: 0; }
+QScrollBar::handle:horizontal { min-width: 30px; border-radius: 5px;
+                                background: #cdd6e0; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 """
+
+
+ARROW_COLORS = {
+    "arrow_down": ("#6b7a89", False),
+    "arrow_up": ("#6b7a89", True),
+    "arrow_down_muted": ("#c3cedb", False),
+    "arrow_up_muted": ("#c3cedb", True),
+}
+# 单独拼接：QSS 的 url() 不接受 data URI，图标必须先落到磁盘。
+ARROW_STYLE = """
+QComboBox::down-arrow { width: 9px; height: 6px; margin-right: 8px;
+                        image: url(@arrow_down@); }
+QComboBox::down-arrow:disabled { image: url(@arrow_down_muted@); }
+QSpinBox::up-arrow { width: 9px; height: 6px; image: url(@arrow_up@); }
+QSpinBox::down-arrow { width: 9px; height: 6px; image: url(@arrow_down@); }
+QSpinBox::up-arrow:disabled { image: url(@arrow_up_muted@); }
+QSpinBox::down-arrow:disabled { image: url(@arrow_down_muted@); }
+"""
+
+
+def build_stylesheet(icon_dir: Path | None = None) -> str:
+    """生成完整样式表；箭头图标写盘失败时退回平台原生箭头。"""
+    target = icon_dir or Path(QDir.tempPath()) / "bosspilot-icons"
+    paths: dict[str, str] = {}
+    for name, (color, up) in ARROW_COLORS.items():
+        points = "1,5 4.5,1.5 8,5" if up else "1,1 4.5,4.5 8,1"
+        svg = (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='9' height='6'>"
+            f"<polyline points='{points}' fill='none' stroke='{color}'"
+            " stroke-width='1.6' stroke-linecap='round'"
+            " stroke-linejoin='round'/></svg>"
+        )
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            path = target / f"{name}.svg"
+            path.write_text(svg, encoding="utf-8")
+        except OSError:
+            return STYLE
+        paths[name] = path.as_posix()
+    arrow_style = ARROW_STYLE
+    for name, path_text in paths.items():
+        arrow_style = arrow_style.replace(f"@{name}@", path_text)
+    return STYLE + arrow_style
 
 
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("BossPilot")
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(build_stylesheet())
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
