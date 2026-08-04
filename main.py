@@ -132,19 +132,34 @@ class SearchOptions:
     max_scrolls: int
     auto_contact: bool
     contact_interval: int
+    fetch_detail: bool = True
 
 
 @dataclass(frozen=True)
 class Job:
+    # 除岗位名外都给默认值：页面改版导致某个字段读不到时不应中断整次采集。
     title: str
-    salary: str
-    area: str
-    experience: str
-    education: str
-    company: str
-    tags: str
-    link: str
+    salary: str = ""
+    area: str = ""
+    experience: str = ""
+    education: str = ""
+    company: str = ""
+    tags: str = ""
+    link: str = ""
     contact_status: str = "未沟通"
+    # 以下字段来自岗位卡片，描述公司概况与 HR。
+    industry: str = ""
+    scale: str = ""
+    stage: str = ""
+    hr_name: str = ""
+    hr_title: str = ""
+    hr_active: str = ""
+    # 以下字段来自点击卡片后列表页右侧的详情面板。
+    skills: str = ""
+    description: str = ""
+    benefits: str = ""
+    address: str = ""
+    detail_status: str = "未读取"
 
 
 SALARY_UNIT_SCALE = {"K": 1.0, "千": 1.0, "W": 10.0, "万": 10.0}
@@ -285,6 +300,23 @@ def append_contact_history(
         "company": job.company,
         "tags": job.tags,
         "link": job.link,
+        "company_profile": {
+            "industry": job.industry,
+            "scale": job.scale,
+            "stage": job.stage,
+        },
+        "hr": {
+            "name": job.hr_name,
+            "title": job.hr_title,
+            "active": job.hr_active,
+        },
+        "detail": {
+            "status": job.detail_status,
+            "skills": job.skills,
+            "description": job.description,
+            "benefits": job.benefits,
+            "address": job.address,
+        },
         "search": {
             "city": options.city,
             "query": options.query,
@@ -384,6 +416,17 @@ class JobWorker(QThread):
                         continue
 
                     self.log_message.emit(f"[匹配] {job.title} | {job.salary}")
+                    if self.options.fetch_detail:
+                        self.status_changed.emit(f"匹配 {job.title}，正在读取岗位详情...")
+                        job = replace(job, **self._read_detail(page, job))
+                        self.log_message.emit(
+                            f"[详情] {job.title} | 状态={job.detail_status} | "
+                            f"技能={job.skills or '空'} | 福利={job.benefits or '空'} | "
+                            f"地址={job.address or '空'} | "
+                            f"HR={job.hr_name or '空'}（{job.hr_title or '未知'}，"
+                            f"{job.hr_active or '活跃度未知'}） | "
+                            f"描述{len(job.description)} 字"
+                        )
                     if self.options.auto_contact:
                         self.status_changed.emit(
                             f"匹配 {job.title}，正在发起沟通..."
@@ -451,6 +494,11 @@ return Array.from(document.querySelectorAll('.job-card-wrapper, .job-card-box, l
     .map(node => (node.innerText || '').trim()).filter(Boolean);
   const details = texts('.tag-list li, .job-info .tag-list li, .job-card-info li');
   const link = card.querySelector('a[href*=\"/job_detail/\"], a.job-card-left, a[href]');
+  // 公司标签里混排了行业、规模与融资阶段，按特征分别挑出来。
+  const companyTags = texts('.company-tag-list li, .company-info .company-tag-list li');
+  const scale = companyTags.find(value => /人|规模/.test(value)) || '';
+  const stage = companyTags.find(value => /融资|上市|不需要融资|天使|轮/.test(value)) || '';
+  const industry = companyTags.find(value => value !== scale && value !== stage) || '';
   return {
     title: text('.job-name, [class*=\"job-name\"]'),
     salary: text('.salary, [class*=\"salary\"]'),
@@ -459,11 +507,91 @@ return Array.from(document.querySelectorAll('.job-card-wrapper, .job-card-box, l
     education: details.find(value => /初中|中专|中技|高中|大专|本科|硕士|博士|学历不限/.test(value)) || '',
     company: text('.company-name, .boss-name, [class*=\"company-name\"]'),
     tags: details.join(' / '),
+    industry: industry,
+    scale: scale,
+    stage: stage,
+    hr_name: text('.info-public em, .job-card-footer .info-public, [class*=\"boss-name\"]'),
+    hr_title: text('.info-public'),
     link: link ? new URL(link.getAttribute('href'), location.origin).href : ''
   };
 }).filter(job => job.title);
 """
         return page.run_js(script) or []
+
+    # 列表页右侧详情面板；点击卡片后异步刷新，需要等标题变化再读取。
+    DETAIL_SCRIPT = r"""
+const panel = document.querySelector('.job-detail-box, .job-detail, .job-detail-container');
+if (!panel) return null;
+const text = selector => (panel.querySelector(selector)?.innerText || '').trim();
+const texts = selector => Array.from(panel.querySelectorAll(selector))
+  .map(node => (node.innerText || '').trim()).filter(Boolean);
+const hrBlock = panel.querySelector('.job-boss-info, .boss-info, [class*=\"boss-info\"]');
+const hrText = hrBlock ? (hrBlock.innerText || '').trim() : '';
+return {
+  title: text('.job-name, .name, h3'),
+  skills: texts('.job-keyword-list li, .tag-list li, [class*=\"keyword\"] li').join(' / '),
+  description: text('.job-sec-text, .job-detail-section .text, [class*=\"job-sec\"] .text'),
+  benefits: texts('.job-tags li, .welfare-list li, [class*=\"welfare\"] li').join(' / '),
+  address: text('.location-address, .job-address .location-address, [class*=\"location-address\"]'),
+  hr_name: text('.boss-info-attr, .boss-name, [class*=\"boss-name\"]'),
+  hr_text: hrText,
+  hr_active: (hrText.match(/(刚刚活跃|今日活跃|本周活跃|\d+(?:分钟|小时|天|周|月)内活跃|活跃于[^\n]*)/) || [''])[0]
+};
+"""
+
+    def _read_detail(self, page: object, job: Job) -> dict[str, str]:
+        """点击岗位卡片，读取列表页右侧详情面板。"""
+        opened = page.run_js(
+            r"""
+const targetUrl = arguments[0];
+const card = Array.from(document.querySelectorAll('.job-card-wrapper, .job-card-box, li.job-card-wrapper'))
+  .find(item => {
+    const link = item.querySelector('a[href*="/job_detail/"], a.job-card-left, a[href]');
+    return link && new URL(link.getAttribute('href'), location.origin).href === targetUrl;
+  });
+if (!card) return false;
+(card.querySelector('a[href*="/job_detail/"], a.job-card-left, a[href]') || card).click();
+return true;
+""",
+            job.link,
+        )
+        if not opened:
+            return {"detail_status": "未找到岗位卡片"}
+
+        # 面板内容异步加载，轮询到标题与当前岗位一致为止。
+        detail: dict[str, str] | None = None
+        for _ in range(20):
+            if self._stop_requested:
+                return {"detail_status": "已停止"}
+            time.sleep(0.4)
+            try:
+                candidate = page.run_js(self.DETAIL_SCRIPT)
+            except Exception as exc:
+                return {"detail_status": f"读取失败：{exc}"}
+            if not candidate:
+                continue
+            detail = candidate
+            panel_title = decode_boss_text(candidate.get("title") or "")
+            if panel_title and (panel_title in job.title or job.title in panel_title):
+                break
+        if not detail:
+            return {"detail_status": "未出现详情面板"}
+
+        values = {
+            key: decode_boss_text(value) if isinstance(value, str) else value
+            for key, value in detail.items()
+            if key in JOB_FIELDS and key != "title"
+        }
+        hr_text = decode_boss_text(detail.get("hr_text") or "")
+        if not values.get("hr_name") and hr_text:
+            values["hr_name"] = hr_text.splitlines()[0].strip()
+        if hr_text:
+            # HR 行形如“杭州橙风信息科技 · hr”，取分隔符后的职位。
+            match = re.search(r"·\s*([^\n]+)", hr_text)
+            if match:
+                values["hr_title"] = match.group(1).strip()
+        values["detail_status"] = "已读取" if values.get("description") else "无职位描述"
+        return values
 
     def _wait_contact_interval(self) -> None:
         for _ in range(self.options.contact_interval * 2):
@@ -528,7 +656,32 @@ class LoginWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    HEADERS = ["岗位", "薪资", "地区", "经验", "学历", "公司", "标签", "沟通状态"]
+    # 表格列：(标题, 取值函数)。导出 CSV 复用同一份定义。
+    COLUMNS: tuple[tuple[str, str], ...] = (
+        ("岗位", "title"),
+        ("薪资", "salary"),
+        ("地区", "area"),
+        ("经验", "experience"),
+        ("学历", "education"),
+        ("公司", "company"),
+        ("行业", "industry"),
+        ("规模", "scale"),
+        ("融资阶段", "stage"),
+        ("HR", "hr_name"),
+        ("HR 职位", "hr_title"),
+        ("HR 活跃", "hr_active"),
+        ("技能要求", "skills"),
+        ("福利", "benefits"),
+        ("工作地址", "address"),
+        ("职位描述", "description"),
+        ("标签", "tags"),
+        ("沟通状态", "contact_status"),
+    )
+    HEADERS = [caption for caption, _ in COLUMNS]
+    STATUS_COLUMN = HEADERS.index("沟通状态")
+    DESCRIPTION_COLUMN = HEADERS.index("职位描述")
+    # 默认隐藏的次要列：仍会采集并导出，可用“显示全部列”展开。
+    OPTIONAL_COLUMNS = ("规模", "融资阶段", "HR 职位", "HR 活跃", "福利", "工作地址", "标签")
 
     def __init__(self) -> None:
         super().__init__()
@@ -641,6 +794,12 @@ class MainWindow(QMainWindow):
         self.contact_interval.setRange(3, 300)
         self.contact_interval.setValue(8)
         self.contact_interval.setSuffix(" 秒")
+        self.fetch_detail = QCheckBox("读取职位描述")
+        self.fetch_detail.setChecked(True)
+        self.fetch_detail.setToolTip(
+            "点击匹配到的岗位卡片，读取列表页右侧的职位描述、技能标签、福利、地址与 HR 信息。"
+            "关闭可以加快采集速度。"
+        )
 
         groups = [
             (
@@ -667,6 +826,7 @@ class MainWindow(QMainWindow):
                     ("最多结果", self.max_results),
                     ("最多加载轮数", self.max_scrolls),
                     ("沟通间隔", self.contact_interval),
+                    ("岗位详情", self.fetch_detail),
                     ("自动沟通", self.auto_contact),
                 ],
             ),
@@ -783,11 +943,35 @@ class MainWindow(QMainWindow):
         self.table.setToolTip("双击任意一行可以打开岗位详情页")
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(42)
-        self.table.horizontalHeader().setHighlightSections(False)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setHighlightSections(False)
+        # 列数较多，改为可手动拖拽 + 预设宽度，避免描述列把表格撑爆。
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        widths = {
+            "岗位": 200,
+            "薪资": 110,
+            "地区": 160,
+            "经验": 80,
+            "学历": 70,
+            "公司": 180,
+            "行业": 110,
+            "规模": 90,
+            "融资阶段": 90,
+            "HR": 90,
+            "HR 职位": 90,
+            "HR 活跃": 90,
+            "技能要求": 200,
+            "福利": 160,
+            "工作地址": 180,
+            "职位描述": 320,
+            "标签": 160,
+            "沟通状态": 110,
+        }
+        for index, caption in enumerate(self.HEADERS):
+            self.table.setColumnWidth(index, widths[caption])
+            if caption in self.OPTIONAL_COLUMNS:
+                self.table.setColumnHidden(index, True)
 
         results = QFrame()
         results.setObjectName("resultsPanel")
@@ -801,8 +985,16 @@ class MainWindow(QMainWindow):
         results_title.setObjectName("sectionTitle")
         self.result_count = QLabel("0 个结果")
         self.result_count.setObjectName("resultCount")
+        self.all_columns = QCheckBox("显示全部列")
+        self.all_columns.setToolTip(
+            "展开公司规模、融资阶段、HR 职位与活跃度、福利、工作地址等次要列。"
+            "隐藏的列同样会被采集并写入导出文件。"
+        )
+        self.all_columns.toggled.connect(self._set_all_columns_visible)
         results_header.addWidget(results_title)
         results_header.addStretch()
+        results_header.addWidget(self.all_columns)
+        results_header.addSpacing(16)
         results_header.addWidget(self.result_count)
         results_layout.addLayout(results_header)
 
@@ -880,6 +1072,7 @@ class MainWindow(QMainWindow):
             max_scrolls=self.max_scrolls.value(),
             auto_contact=self.auto_contact.isChecked(),
             contact_interval=self.contact_interval.value(),
+            fetch_detail=self.fetch_detail.isChecked(),
         )
         self.clear_results()
         self.worker = JobWorker(options)
@@ -944,22 +1137,15 @@ class MainWindow(QMainWindow):
         self.jobs.append(job)
         row = self.table.rowCount()
         self.table.insertRow(row)
-        values = [
-            job.title,
-            job.salary,
-            job.area,
-            job.experience,
-            job.education,
-            job.company,
-            job.tags,
-            job.contact_status,
-        ]
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            item.setToolTip(value)
+        for column, (_, field) in enumerate(self.COLUMNS):
+            value = getattr(job, field)
+            display = " ".join(value.split()) if column == self.DESCRIPTION_COLUMN else value
+            item = QTableWidgetItem(display)
+            # 描述是大段文本，tooltip 保留原始换行便于阅读。
+            item.setToolTip(value or "")
             if column == 0:
                 item.setData(Qt.ItemDataRole.UserRole, job.link)
-            if column == len(values) - 1:
+            if column == self.STATUS_COLUMN:
                 item.setForeground(QColor(CONTACT_STATUS_COLORS.get(value, "#b45309")))
             self.table.setItem(row, column, item)
         self.export_button.setEnabled(True)
@@ -997,18 +1183,12 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as file:
                 writer = csv.writer(file)
-                writer.writerow([*self.HEADERS, "链接"])
+                writer.writerow([*self.HEADERS, "详情状态", "链接"])
                 for job in self.jobs:
                     writer.writerow(
                         [
-                            job.title,
-                            job.salary,
-                            job.area,
-                            job.experience,
-                            job.education,
-                            job.company,
-                            job.tags,
-                            job.contact_status,
+                            *(getattr(job, field) for _, field in self.COLUMNS),
+                            job.detail_status,
                             job.link,
                         ]
                     )
@@ -1033,6 +1213,13 @@ class MainWindow(QMainWindow):
         self.clear_button.setEnabled(bool(self.jobs) and not running)
         self.progress.setVisible(running)
         self._sync_salary_enabled(self.salary_mode.currentText())
+
+    @Slot(bool)
+    def _set_all_columns_visible(self, visible: bool) -> None:
+        """切换次要列的显示；隐藏列不影响采集与导出。"""
+        for index, caption in enumerate(self.HEADERS):
+            if caption in self.OPTIONAL_COLUMNS:
+                self.table.setColumnHidden(index, not visible)
 
     @Slot(str)
     def _sync_salary_enabled(self, mode: str) -> None:
@@ -1079,6 +1266,7 @@ class MainWindow(QMainWindow):
                 f"岗位关键词：{self.keywords.text().strip() or '无'}（{self.keyword_mode.currentText()}） | "
                 f"薪资：{salary} | 经验：{self.experience.currentText()} | "
                 f"学历：{self.education.currentText()} | "
+                f"岗位详情：{'读取' if self.fetch_detail.isChecked() else '跳过'} | "
                 f"自动沟通：{'开启' if self.auto_contact.isChecked() else '关闭'}"
             )
         self.filters_summary.setVisible(collapsed)
@@ -1112,6 +1300,9 @@ class MainWindow(QMainWindow):
         self.auto_contact.setChecked(
             settings.value("filters/auto_contact", True, type=bool)
         )
+        self.fetch_detail.setChecked(
+            settings.value("filters/fetch_detail", True, type=bool)
+        )
         self.contact_interval.setValue(
             settings.value(
                 "filters/contact_interval", self.contact_interval.value(), type=int
@@ -1120,6 +1311,10 @@ class MainWindow(QMainWindow):
         self.filters_toggle.setChecked(
             settings.value("window/filters_collapsed", False, type=bool)
         )
+        # 显式同步一次：勾选状态未变化时 toggled 不会触发。
+        show_all = settings.value("window/all_columns", False, type=bool)
+        self.all_columns.setChecked(show_all)
+        self._set_all_columns_visible(show_all)
         geometry = settings.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
@@ -1142,20 +1337,62 @@ class MainWindow(QMainWindow):
             "max_scrolls": self.max_scrolls.value(),
             "auto_contact": self.auto_contact.isChecked(),
             "contact_interval": self.contact_interval.value(),
+            "fetch_detail": self.fetch_detail.isChecked(),
         }
         for key, value in values.items():
             settings.setValue(f"filters/{key}", value)
         settings.setValue("window/filters_collapsed", self.filters_toggle.isChecked())
+        settings.setValue("window/all_columns", self.all_columns.isChecked())
         settings.setValue("window/geometry", self.saveGeometry())
         settings.setValue("window/splitter", self.main_splitter.saveState())
         settings.sync()
 
     @Slot(int, int)
-    def open_job(self, row: int, _column: int) -> None:
+    def open_job(self, row: int, column: int) -> None:
+        # 双击描述列查看大段文本，双击其他列打开岗位详情页。
+        if column == self.DESCRIPTION_COLUMN:
+            self.show_job_detail(row)
+            return
         item = self.table.item(row, 0)
         link = item.data(Qt.ItemDataRole.UserRole) if item else None
         if link:
             QDesktopServices.openUrl(QUrl(link))
+
+    def show_job_detail(self, row: int) -> None:
+        """在弹窗中展示岗位的完整招聘要求与公司、HR 信息。"""
+        if not 0 <= row < len(self.jobs):
+            return
+        job = self.jobs[row]
+        company_line = " · ".join(
+            part for part in (job.company, job.industry, job.scale, job.stage) if part
+        )
+        hr_line = " · ".join(
+            part for part in (job.hr_name, job.hr_title, job.hr_active) if part
+        )
+        sections = [
+            f"{job.title}　{job.salary}",
+            f"{job.area} | {job.experience} | {job.education}",
+            f"公司：{company_line or '未读取'}",
+            f"HR：{hr_line or '未读取'}",
+            f"技能要求：{job.skills or '未读取'}",
+            f"福利：{job.benefits or '未读取'}",
+            f"工作地址：{job.address or '未读取'}",
+            "",
+            "职位描述：",
+            job.description or f"（{job.detail_status}）",
+        ]
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("岗位详情")
+        dialog.setText(job.title)
+        dialog.setInformativeText("\n".join(sections))
+        dialog.setStandardButtons(QMessageBox.StandardButton.Close)
+        if job.link:
+            open_button = dialog.addButton("打开岗位页", QMessageBox.ButtonRole.ActionRole)
+            dialog.exec()
+            if dialog.clickedButton() is open_button:
+                QDesktopServices.openUrl(QUrl(job.link))
+            return
+        dialog.exec()
 
     def closeEvent(self, event: object) -> None:
         self._save_settings()
@@ -1207,6 +1444,7 @@ QSpinBox::down-button { subcontrol-position: bottom right; margin: 0 5px 4px 0; 
 QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #eef3f7;
                                                         border-radius: 3px; }
 QCheckBox { spacing: 8px; min-height: 31px; color: #1f2a37; }
+QFrame#resultsPanel QCheckBox { min-height: 22px; color: #5a6b7b; }
 QCheckBox::indicator { width: 17px; height: 17px; border: 1px solid #c3cedb;
     border-radius: 5px; background: #ffffff; }
 QCheckBox::indicator:hover { border-color: #0d7d8c; }
