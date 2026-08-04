@@ -5,7 +5,7 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -156,6 +156,19 @@ def _salary_to_k(value: float, unit: str) -> float | None:
     return value / 1000 if value >= 1000 else None
 
 
+JOB_FIELDS = frozenset(field.name for field in fields(Job))
+
+
+def build_job(data: dict[str, object]) -> Job:
+    """把页面读到的原始字段解码后构造 Job，忽略未知字段。"""
+    values = {
+        key: decode_boss_text(value) if isinstance(value, str) else value
+        for key, value in data.items()
+        if key in JOB_FIELDS
+    }
+    return Job(**values)
+
+
 def parse_monthly_salary(text: str) -> tuple[float, float] | None:
     """把岗位薪资文案解析为以 K（千元）为单位的月薪区间。"""
     normalized = re.sub(r"\s+", "", text.upper().replace("Ｋ", "K"))
@@ -297,7 +310,7 @@ class JobWorker(QThread):
         self._stop_requested = True
 
     def run(self) -> None:
-        browser: Chromium | None = None
+        # 采集结束后不关闭浏览器，便于用户查看结果并保留登录状态。
         try:
             self.status_changed.emit("正在启动浏览器...")
             co = ChromiumOptions()
@@ -332,17 +345,18 @@ class JobWorker(QThread):
                 f"经验={self.options.experience} | 学历={self.options.education}"
             )
 
-            for round_number in range(self.options.max_scrolls + 1):
+            for round_number in range(self.options.max_scrolls):
                 if self._stop_requested:
                     break
-                cards = self._read_cards(page)
+                try:
+                    cards = self._read_cards(page)
+                except Exception as exc:
+                    # 单轮读取失败（页面跳转、脚本执行超时等）不应终止整次采集。
+                    self.log_message.emit(f"[读取失败] 本轮跳过：{exc}")
+                    cards = []
                 for data in cards:
                     raw_salary = data.get("salary", "")
-                    data = {
-                        key: decode_boss_text(value) if isinstance(value, str) else value
-                        for key, value in data.items()
-                    }
-                    job = Job(**data)
+                    job = build_job(data)
                     identity = job.link or f"{job.title}|{job.company}|{job.salary}"
                     if identity in seen:
                         continue
@@ -402,9 +416,6 @@ class JobWorker(QThread):
             self.completed.emit(matched)
         except Exception as exc:
             self.failed.emit(str(exc))
-        finally:
-            # Keep the browser open so the user can inspect results and retain login state.
-            browser = None
 
     def _wait_for_cards(self, page: object) -> bool:
         for _ in range(120):
@@ -722,6 +733,8 @@ class MainWindow(QMainWindow):
 
         self.login_button.clicked.connect(self.open_login)
         self.filters_toggle.toggled.connect(self._set_filters_collapsed)
+        self.salary_mode.currentTextChanged.connect(self._sync_salary_enabled)
+        self._sync_salary_enabled(self.salary_mode.currentText())
         self.start_button.clicked.connect(self.start_search)
         self.stop_button.clicked.connect(self.stop_search)
         self.export_button.clicked.connect(self.export_csv)
@@ -796,7 +809,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def append_log(self, message: str) -> None:
-        self.console.appendPlainText(message)
+        self.console.appendPlainText(f"{datetime.now():%H:%M:%S} {message}")
 
     @Slot()
     def stop_search(self) -> None:
@@ -829,7 +842,7 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem(value)
             item.setToolTip(value)
             if column == 0:
-                item.setData(256, job.link)
+                item.setData(Qt.ItemDataRole.UserRole, job.link)
             self.table.setItem(row, column, item)
         self.export_button.setEnabled(True)
         self._update_results_state()
@@ -862,24 +875,29 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        with open(path, "w", newline="", encoding="utf-8-sig") as file:
-            writer = csv.writer(file)
-            writer.writerow([*self.HEADERS, "链接"])
-            for job in self.jobs:
-                writer.writerow(
-                    [
-                        job.title,
-                        job.salary,
-                        job.area,
-                        job.experience,
-                        job.education,
-                        job.company,
-                        job.tags,
-                        job.contact_status,
-                        job.link,
-                    ]
-                )
-        self._set_status(f"已导出到 {path}", "success")
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow([*self.HEADERS, "链接"])
+                for job in self.jobs:
+                    writer.writerow(
+                        [
+                            job.title,
+                            job.salary,
+                            job.area,
+                            job.experience,
+                            job.education,
+                            job.company,
+                            job.tags,
+                            job.contact_status,
+                            job.link,
+                        ]
+                    )
+        except OSError as exc:
+            self._set_status(f"导出失败：{exc}", "error")
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self._set_status(f"已导出 {len(self.jobs)} 条到 {path}", "success")
 
     @Slot()
     def open_contact_history(self) -> None:
@@ -895,6 +913,12 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(running)
         self.clear_button.setEnabled(bool(self.jobs) and not running)
         self.progress.setVisible(running)
+        self._sync_salary_enabled(self.salary_mode.currentText())
+
+    @Slot(str)
+    def _sync_salary_enabled(self, mode: str) -> None:
+        """薪资规则选择“不限”时，目标月薪输入没有意义。"""
+        self.salary.setEnabled(mode != "不限" and self.start_button.isEnabled())
 
     def _update_results_state(self) -> None:
         """根据结果数量切换空状态与岗位表格。"""
@@ -994,8 +1018,9 @@ class MainWindow(QMainWindow):
     @Slot(int, int)
     def open_job(self, row: int, _column: int) -> None:
         item = self.table.item(row, 0)
-        if item and item.data(256):
-            QDesktopServices.openUrl(QUrl(item.data(256)))
+        link = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if link:
+            QDesktopServices.openUrl(QUrl(link))
 
     def closeEvent(self, event: object) -> None:
         self._save_settings()
