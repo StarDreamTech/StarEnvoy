@@ -144,6 +144,64 @@ def test_contact_actions() -> None:
     assert JobWorker._contact(Page(False, new_button), job) == "未找到岗位卡片"
 
 
+def test_read_detail() -> None:
+    """详情面板标题与岗位一致时读取字段，并从 HR 文本补出职位。"""
+
+    class Page:
+        def __init__(self, detail: dict[str, str] | None) -> None:
+            self.detail = detail
+
+        def run_js(self, script: str, *args: object) -> object:
+            # 第一次调用是点击卡片的脚本，带 link 参数。
+            return True if args else self.detail
+
+    job = Job("python 工程师", "14-28K", "杭州", "经验不限", "本科", "橙风信息", "", "https://e.com/1")
+    worker = JobWorker(options())
+    main.time.sleep = lambda _seconds: None
+
+    detail = worker._read_detail(
+        Page(
+            {
+                "title": "python 工程师",
+                "skills": "PyTorch / Docker / MySQL",
+                "description": "1. 熟练掌握Python语言。\n2. 了解大模型优先。",
+                "benefits": "五险一金 / 加班补助",
+                "address": "杭州萧山区天人大厦33",
+                "hr_name": "",
+                "hr_text": "刘晨 刚刚活跃\n杭州橙风信息科技 · hr",
+                "hr_active": "刚刚活跃",
+            }
+        ),
+        job,
+    )
+    assert detail["detail_status"] == "已读取"
+    assert detail["skills"] == "PyTorch / Docker / MySQL"
+    assert detail["address"] == "杭州萧山区天人大厦33"
+    assert detail["hr_name"] == "刘晨 刚刚活跃"
+    assert detail["hr_title"] == "hr"
+    assert detail["hr_active"] == "刚刚活跃"
+    assert "了解大模型优先" in detail["description"]
+    assert "hr_text" not in detail
+
+    assert worker._read_detail(Page(None), job)["detail_status"] == "未出现详情面板"
+    no_desc = worker._read_detail(Page({"title": "python 工程师", "description": ""}), job)
+    assert no_desc["detail_status"] == "无职位描述"
+
+
+def test_build_job_ignores_unknown_fields() -> None:
+    job = main.build_job(
+        {
+            "title": "Python后端",
+            "salary": "-K",
+            "scale": "100-499人",
+            "unexpected": "忽略",
+        }
+    )
+    assert job.salary == "12-20K"
+    assert job.scale == "100-499人"
+    assert job.detail_status == "未读取"
+
+
 def test_contact_history() -> None:
     job = Job("Python后端", "12-20K", "杭州", "3-5年", "本科", "示例科技", "Python", "https://example.com/job")
     with TemporaryDirectory() as directory:
