@@ -66,6 +66,30 @@ EXPERIENCES = [
 ]
 EDUCATIONS = ["不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"]
 SALARY_MODES = ["最低薪资不低于", "薪资范围包含", "不限"]
+# 档位越大要求越高；岗位要求不高于所选档位即视为匹配。
+EXPERIENCE_LEVELS = {
+    "在校/应届": 0,
+    "应届": 0,
+    "在校": 0,
+    "1年以内": 1,
+    "1年内": 1,
+    "1-3年": 2,
+    "3-5年": 3,
+    "5-10年": 4,
+    "10年以上": 5,
+}
+EDUCATION_LEVELS = {
+    "初中及以下": 0,
+    "初中": 0,
+    "中专/中技": 1,
+    "中专": 1,
+    "中技": 1,
+    "高中": 2,
+    "大专": 3,
+    "本科": 4,
+    "硕士": 5,
+    "博士": 6,
+}
 CARD_SELECTORS = ".job-card-wrapper, .job-card-box, li.job-card-wrapper"
 PROJECT_DIR = Path(__file__).resolve().parent
 USER_DATA_PATH = PROJECT_DIR / "user_data"
@@ -116,19 +140,43 @@ class Job:
     contact_status: str = "未沟通"
 
 
+SALARY_UNIT_SCALE = {"K": 1.0, "千": 1.0, "W": 10.0, "万": 10.0}
+NON_MONTHLY_RE = re.compile(r"/\s*(天|日|时|小时|周|年)")
+SALARY_RANGE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*([KW千万]?)\s*[-~～至－—]\s*(\d+(?:\.\d+)?)\s*([KW千万]?)"
+)
+SALARY_SINGLE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([KW千万])")
+
+
+def _salary_to_k(value: float, unit: str) -> float | None:
+    """把带单位的薪资数值换算成 K（千元），无法确定单位时返回 None。"""
+    if unit:
+        return value * SALARY_UNIT_SCALE[unit]
+    # 没有单位时只接受“12000-17000元/月”这类整元写法。
+    return value / 1000 if value >= 1000 else None
+
+
 def parse_monthly_salary(text: str) -> tuple[float, float] | None:
-    """Return the advertised monthly salary range in K."""
-    normalized = text.upper().replace("Ｋ", "K").replace(" ", "")
-    match = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)K", normalized)
+    """把岗位薪资文案解析为以 K（千元）为单位的月薪区间。"""
+    normalized = re.sub(r"\s+", "", text.upper().replace("Ｋ", "K"))
+    if NON_MONTHLY_RE.search(normalized):
+        # 日结、时薪、年薪无法与月薪直接比较。
+        return None
+
+    match = SALARY_RANGE_RE.search(normalized)
     if match:
-        return float(match.group(1)), float(match.group(2))
-    match = re.search(r"(\d+(?:\.\d+)?)K", normalized)
+        low_text, low_unit, high_text, high_unit = match.groups()
+        fallback = low_unit or high_unit
+        low = _salary_to_k(float(low_text), low_unit or fallback)
+        high = _salary_to_k(float(high_text), high_unit or fallback)
+        if low is None or high is None:
+            return None
+        return (low, high) if low <= high else (high, low)
+
+    match = SALARY_SINGLE_RE.search(normalized)
     if match:
-        value = float(match.group(1))
-        return value, value
-    match = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)元/月", normalized)
-    if match:
-        return float(match.group(1)) / 1000, float(match.group(2)) / 1000
+        value = _salary_to_k(float(match.group(1)), match.group(2))
+        return None if value is None else (value, value)
     return None
 
 
@@ -138,6 +186,37 @@ def decode_boss_text(text: str) -> str:
 
 def parse_keywords(text: str) -> tuple[str, ...]:
     return tuple(word.strip() for word in re.split(r"[,，]", text) if word.strip())
+
+
+def _match_level(text: str, levels: dict[str, int]) -> int | None:
+    """从岗位要求文案中读出档位，优先匹配更长的标签（如“1-3年”先于“1年”）。"""
+    for label in sorted(levels, key=len, reverse=True):
+        if label in text:
+            return levels[label]
+    return None
+
+
+def _level_rejection_reason(
+    name: str, job_text: str, selected: str, levels: dict[str, int]
+) -> str | None:
+    """比较岗位要求与所选档位；岗位要求不高于所选即通过。"""
+    if selected == "不限":
+        return None
+    text = job_text or ""
+    if selected not in levels:
+        # 例如“经验不限”这类只按原文匹配的选项。
+        if selected in text:
+            return None
+        return f"{name}不符：读取 {text or '空'}，要求 {selected}"
+    if "不限" in text:
+        # 岗位本身不限，任何档位都可投递。
+        return None
+    job_level = _match_level(text, levels)
+    if job_level is None:
+        return f"{name}无法识别：读取 {text or '空'}，要求 {selected}"
+    if job_level > levels[selected]:
+        return f"{name}不符：岗位要求 {text}，高于 {selected}"
+    return None
 
 
 def job_rejection_reason(job: Job, options: SearchOptions) -> str | None:
@@ -159,11 +238,11 @@ def job_rejection_reason(job: Job, options: SearchOptions) -> str | None:
         if options.salary_mode == "薪资范围包含" and not low <= options.salary_k <= high:
             return f"{options.salary_k}K 不在 {low:g}-{high:g}K 范围内"
 
-    if options.experience != "不限" and options.experience not in job.experience:
-        return f"经验不符：读取 {job.experience or '空'}，要求 {options.experience}"
-    if options.education != "不限" and options.education not in job.education:
-        return f"学历不符：读取 {job.education or '空'}，要求 {options.education}"
-    return None
+    return _level_rejection_reason(
+        "经验", job.experience, options.experience, EXPERIENCE_LEVELS
+    ) or _level_rejection_reason(
+        "学历", job.education, options.education, EDUCATION_LEVELS
+    )
 
 
 def job_matches(job: Job, options: SearchOptions) -> bool:
@@ -486,8 +565,10 @@ class MainWindow(QMainWindow):
         self.salary_mode.addItems(SALARY_MODES)
         self.experience = QComboBox()
         self.experience.addItems(EXPERIENCES)
+        self.experience.setToolTip("岗位要求不高于所选档位即视为匹配，标注“经验不限”的岗位始终通过")
         self.education = QComboBox()
         self.education.addItems(EDUCATIONS)
+        self.education.setToolTip("岗位要求不高于所选学历即视为匹配，标注“学历不限”的岗位始终通过")
         self.max_results = QSpinBox()
         self.max_results.setRange(1, 1000)
         self.max_results.setValue(100)
@@ -512,8 +593,8 @@ class MainWindow(QMainWindow):
         right_fields = [
             ("目标月薪", self.salary),
             ("薪资规则", self.salary_mode),
-            ("工作经验", self.experience),
-            ("学历要求", self.education),
+            ("我的工作经验", self.experience),
+            ("我的学历", self.education),
             ("最多加载轮数", self.max_scrolls),
             ("沟通间隔", self.contact_interval),
         ]

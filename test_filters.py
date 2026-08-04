@@ -44,6 +44,17 @@ def test_salary_parser() -> None:
     assert parse_monthly_salary("12000-17000元/月") == (12, 17)
 
 
+def test_salary_parser_units() -> None:
+    assert parse_monthly_salary("20K-30K") == (20, 30)
+    assert parse_monthly_salary("1.5-2万") == (15, 20)
+    assert parse_monthly_salary("8千-1.2万") == (8, 12)
+    assert parse_monthly_salary("15K") == (15, 15)
+    assert parse_monthly_salary("面议") is None
+    assert parse_monthly_salary("13薪") is None
+    assert parse_monthly_salary("50万/年") is None
+    assert parse_monthly_salary("500-800") is None
+
+
 def test_keyword_parser() -> None:
     assert parse_keywords("Python, 全栈，Python后端") == (
         "Python",
@@ -59,6 +70,37 @@ def test_job_filters() -> None:
     assert job_matches(job, options(salary_k=15, salary_mode="薪资范围包含"))
     assert job_matches(job, options(title_keywords=("PYTHON后端",)))
     assert job_matches(job, options(title_keywords=("python后端",)))
+
+
+def test_unlimited_requirements_are_accepted() -> None:
+    job = Job(
+        "Python后端开发",
+        "12-20K",
+        "杭州·西湖区",
+        "经验不限",
+        "学历不限",
+        "示例科技",
+        "Python",
+        "https://example.com",
+    )
+    assert job_matches(job, options())
+
+
+def test_lower_requirements_are_accepted() -> None:
+    """岗位要求低于所选档位时也应通过（本科可投大专岗）。"""
+    job = Job(
+        "Python后端开发",
+        "12-20K",
+        "杭州·西湖区",
+        "1-3年",
+        "大专",
+        "示例科技",
+        "Python",
+        "https://example.com",
+    )
+    assert job_matches(job, options())
+    assert not job_matches(job, options(experience="1年以内", education="大专"))
+    assert not job_matches(job, options(education="高中"))
 
 
 def test_contact_actions() -> None:
