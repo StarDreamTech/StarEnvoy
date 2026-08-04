@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 browser_data/
+user_data/
+data/contact_history.jsonl
