@@ -16,7 +16,7 @@ from urllib.request import urlopen
 
 from DrissionPage import Chromium, ChromiumOptions
 from PySide6.QtCore import QDir, QSettings, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QPixmap, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -194,6 +195,37 @@ def build_job(data: dict[str, object]) -> Job:
         if key in JOB_FIELDS
     }
     return Job(**values)
+
+
+def job_from_history_record(record: dict[str, object]) -> Job:
+    detail = record.get("detail")
+    detail = detail if isinstance(detail, dict) else {}
+    company_profile = record.get("company_profile")
+    company_profile = company_profile if isinstance(company_profile, dict) else {}
+    hr = record.get("hr")
+    hr = hr if isinstance(hr, dict) else {}
+    return Job(
+        title=str(record.get("title") or ""),
+        salary=str(record.get("salary") or ""),
+        area=str(record.get("area") or ""),
+        experience=str(record.get("experience") or ""),
+        education=str(record.get("education") or ""),
+        company=str(record.get("company") or ""),
+        tags=str(record.get("tags") or ""),
+        link=str(record.get("link") or ""),
+        contact_status=str(record.get("status") or ""),
+        industry=str(company_profile.get("industry") or ""),
+        scale=str(company_profile.get("scale") or ""),
+        stage=str(company_profile.get("stage") or ""),
+        hr_name=str(hr.get("name") or ""),
+        hr_title=str(hr.get("title") or ""),
+        hr_active=str(hr.get("active") or ""),
+        skills=str(detail.get("skills") or ""),
+        description=str(detail.get("description") or ""),
+        benefits=str(detail.get("benefits") or ""),
+        address=str(detail.get("address") or ""),
+        detail_status=str(detail.get("status") or "未读取"),
+    )
 
 
 def parse_monthly_salary(text: str) -> tuple[float, float] | None:
@@ -588,12 +620,21 @@ const texts = selector => Array.from(panel.querySelectorAll(selector))
   .map(node => (node.innerText || '').trim()).filter(Boolean);
 const hrBlock = panel.querySelector('.job-boss-info, .boss-info, [class*=\"boss-info\"]');
 const hrText = hrBlock ? (hrBlock.innerText || '').trim() : '';
+const sectionText = (start, stops) => {
+  const lines = (panel.innerText || '').split('\n').map(line => line.trim());
+  const startIndex = lines.findIndex(line => line === start);
+  if (startIndex < 0) return '';
+  const endIndex = lines.findIndex((line, index) => index > startIndex && stops.includes(line));
+  return lines.slice(startIndex + 1, endIndex < 0 ? undefined : endIndex).join('\n').trim();
+};
 return {
   title: text('.job-name, .name, h3'),
   skills: texts('.job-keyword-list li, .tag-list li, [class*=\"keyword\"] li').join(' / '),
-  description: text('.job-sec-text, .job-detail-section .text, [class*=\"job-sec\"] .text'),
+  description: text('.job-sec-text, .job-detail-section .text, [class*=\"job-sec\"] .text')
+    || sectionText('职位描述', ['工作地址', '去App', '前往App', '查看更多信息']),
   benefits: texts('.job-tags li, .welfare-list li, [class*=\"welfare\"] li').join(' / '),
-  address: text('.location-address, .job-address .location-address, [class*=\"location-address\"]'),
+  address: text('.location-address, .job-address .location-address, [class*=\"location-address\"]')
+    || sectionText('工作地址', ['点击查看地图', '查看更多信息']),
   hr_name: text('.boss-info-attr, .boss-name, [class*=\"boss-name\"]'),
   hr_text: hrText,
   hr_active: (hrText.match(/(刚刚活跃|今日活跃|本周活跃|\d+(?:分钟|小时|天|周|月)内活跃|活跃于[^\n]*)/) || [''])[0]
@@ -750,9 +791,12 @@ class MainWindow(QMainWindow):
         ("HR", "hr"),
         ("搜索词", "query"),
         ("状态", "status"),
+        ("岗位链接", "link"),
+        ("跳转", "open"),
     )
     HISTORY_HEADERS = [caption for caption, _ in HISTORY_COLUMNS]
     HISTORY_STATUS_COLUMN = HISTORY_HEADERS.index("状态")
+    HISTORY_OPEN_COLUMN = HISTORY_HEADERS.index("跳转")
     TAB_FILTERS, TAB_RESULTS, TAB_HISTORY, TAB_CONSOLE = range(4)
     # 状态卡下方常驻的条件胶囊：(键, 说明)，取值见 _filter_chip_values。
     FILTER_CHIPS: tuple[tuple[str, str], ...] = (
@@ -771,6 +815,7 @@ class MainWindow(QMainWindow):
         self.worker: JobWorker | None = None
         self.login_worker: LoginWorker | None = None
         self.jobs: list[Job] = []
+        self.history_records: list[dict[str, object]] = []
         self.setWindowTitle("BossPilot 岗位筛选")
         self.setMinimumSize(980, 700)
         self.resize(1180, 790)
@@ -807,7 +852,7 @@ class MainWindow(QMainWindow):
         self.export_button.clicked.connect(self.export_csv)
         self.clear_button.clicked.connect(self.clear_results)
         self.table.cellDoubleClicked.connect(self.open_job)
-        self.history_table.cellDoubleClicked.connect(self.open_history_link)
+        self.history_table.cellDoubleClicked.connect(self.show_history_detail)
         self.tabs.currentChanged.connect(self._tab_changed)
 
     def _build_header(self) -> QHBoxLayout:
@@ -1191,18 +1236,21 @@ class MainWindow(QMainWindow):
         self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.history_table.setShowGrid(False)
         self.history_table.setWordWrap(False)
-        self.history_table.setToolTip("双击任意一行可以打开岗位页")
+        self.history_table.setToolTip("双击任意一行查看岗位详情，点击“打开”跳转岗位页")
         self.history_table.verticalHeader().setVisible(False)
         self.history_table.verticalHeader().setDefaultSectionSize(38)
         history_header = self.history_table.horizontalHeader()
         history_header.setHighlightSections(False)
         history_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        # 最后一列跟随窗口拉伸，避免出现只差 1px 的横向滚动条。
+        # 状态列跟随窗口拉伸，避免出现只差 1px 的横向滚动条。
         history_header.setSectionResizeMode(
             self.HISTORY_STATUS_COLUMN, QHeaderView.ResizeMode.Stretch
         )
+        history_header.setSectionResizeMode(
+            self.HISTORY_OPEN_COLUMN, QHeaderView.ResizeMode.Fixed
+        )
         history_header.setStretchLastSection(False)
-        for index, width in enumerate((165, 210, 100, 140, 180, 150, 100, 150)):
+        for index, width in enumerate((165, 210, 100, 140, 180, 150, 100, 150, 260, 80)):
             self.history_table.setColumnWidth(index, width)
 
         page = QWidget()
@@ -1543,12 +1591,24 @@ class MainWindow(QMainWindow):
         records.reverse()  # 最近的沟通排在最前
 
         self.history_table.setRowCount(0)
+        self.history_records = records
         for record in records:
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
             for column, (_, key) in enumerate(self.HISTORY_COLUMNS):
                 item = QTableWidgetItem(self._history_cell(record, key))
                 item.setToolTip(item.text())
+                if key == "open":
+                    button = QToolButton()
+                    button.setText("打开")
+                    button.setObjectName("mini")
+                    button.setToolTip(str(record.get("link") or "无岗位链接"))
+                    button.setEnabled(bool(record.get("link")))
+                    button.clicked.connect(
+                        lambda _checked=False, link=str(record.get("link") or ""): self.open_link(link)
+                    )
+                    self.history_table.setCellWidget(row, column, button)
+                    continue
                 if column == 0:
                     item.setData(
                         Qt.ItemDataRole.UserRole, str(record.get("link") or "")
@@ -1579,12 +1639,14 @@ class MainWindow(QMainWindow):
             search = record.get("search")
             search = search if isinstance(search, dict) else {}
             return str(search.get("query") or "")
+        if key == "link":
+            link = str(record.get("link") or "")
+            return link.replace("https://", "").replace("http://", "")
+        if key == "open":
+            return ""
         return str(record.get(key) or "")
 
-    @Slot(int, int)
-    def open_history_link(self, row: int, _column: int) -> None:
-        item = self.history_table.item(row, 0)
-        link = item.data(Qt.ItemDataRole.UserRole) if item else None
+    def open_link(self, link: str) -> None:
         if link:
             QDesktopServices.openUrl(QUrl(link))
 
@@ -1671,11 +1733,22 @@ class MainWindow(QMainWindow):
         if link:
             QDesktopServices.openUrl(QUrl(link))
 
+    @Slot(int, int)
+    def show_history_detail(self, row: int, _column: int) -> None:
+        if 0 <= row < len(self.history_records):
+            self.show_job_record_detail(self.history_records[row])
+
+    def show_job_record_detail(self, record: dict[str, object]) -> None:
+        self.show_job_detail_for(job_from_history_record(record))
+
     def show_job_detail(self, row: int) -> None:
         """在弹窗中展示岗位的完整招聘要求与公司、HR 信息。"""
         if not 0 <= row < len(self.jobs):
             return
-        job = self.jobs[row]
+        self.show_job_detail_for(self.jobs[row])
+
+    def show_job_detail_for(self, job: Job) -> None:
+        """在弹窗中展示岗位的完整招聘要求与公司、HR 信息。"""
         company_line = " · ".join(
             part for part in (job.company, job.industry, job.scale, job.stage) if part
         )
@@ -1793,9 +1866,9 @@ QPushButton#danger { color: #b4403f; border-color: #edc9c8; background: #fdf5f5;
 QPushButton#danger:hover { background: #fbe9e8; border-color: #e0a7a6; }
 QPushButton#danger:disabled { color: #c0aeae; background: #f5f0f0;
                               border-color: #ece2e2; }
-QPushButton#mini { min-height: 26px; padding: 0 11px; font-size: 12px;
+QPushButton#mini, QToolButton#mini { min-height: 26px; padding: 0 11px; font-size: 12px;
                    color: #5a6b7b; }
-QPushButton#mini:hover { color: #1f2a37; }
+QPushButton#mini:hover, QToolButton#mini:hover { color: #1f2a37; }
 
 QFrame#statusPanel { border: 1px solid #dde5ee; border-radius: 10px;
                      background: #ffffff; }

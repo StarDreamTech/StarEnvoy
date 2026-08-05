@@ -10,6 +10,7 @@ from main import (
     append_contact_history,
     boss_browser_options,
     decode_boss_text,
+    job_from_history_record,
     job_matches,
     parse_keywords,
     parse_monthly_salary,
@@ -233,6 +234,50 @@ def test_build_job_ignores_unknown_fields() -> None:
     assert job.salary == "12-20K"
     assert job.scale == "100-499人"
     assert job.detail_status == "未读取"
+
+
+def test_history_record_keeps_detail_description() -> None:
+    job = job_from_history_record(
+        {
+            "title": "Python后端",
+            "salary": "20-40K",
+            "link": "https://example.com/job",
+            "company_profile": {"industry": "AI", "scale": "100-499人"},
+            "hr": {"name": "沈盼盼", "title": "招聘者"},
+            "detail": {
+                "status": "已读取",
+                "skills": "Python / MySQL",
+                "description": "岗位职责：写 Python。",
+                "address": "杭州钱塘区",
+            },
+        }
+    )
+    assert job.description == "岗位职责：写 Python。"
+    assert job.detail_status == "已读取"
+    assert job.address == "杭州钱塘区"
+    assert job.hr_name == "沈盼盼"
+
+
+def test_browser_options_reuses_only_live_saved_port() -> None:
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "browser_port.txt"
+        path.write_text("9222", encoding="utf-8")
+
+        first = boss_browser_options(
+            path,
+            port_factory=lambda: 9333,
+            alive_check=lambda port: port == 9222,
+        )
+        assert first.address == "127.0.0.1:9222"
+        assert path.read_text(encoding="utf-8") == "9222"
+
+        second = boss_browser_options(
+            path,
+            port_factory=lambda: 9444,
+            alive_check=lambda _port: False,
+        )
+        assert second.address == "127.0.0.1:9444"
+        assert path.read_text(encoding="utf-8") == "9444"
 
 
 def test_contact_history() -> None:
