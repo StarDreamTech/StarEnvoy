@@ -1,5 +1,9 @@
 # BossPilot
 
+<p align="center">
+  <img src="assets/logo.png" alt="BossPilot Logo" width="240">
+</p>
+
 基于 Python、PySide6、uv 和 DrissionPage 的 BOSS 岗位筛选工具。
 
 ## 开始使用

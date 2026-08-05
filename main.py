@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from DrissionPage import Chromium, ChromiumOptions
 from PySide6.QtCore import QDir, QSettings, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -99,6 +99,7 @@ CONTACT_STATUS_COLORS = {
     "未沟通": "#8b98a5",
 }
 PROJECT_DIR = Path(__file__).resolve().parent
+LOGO_PATH = PROJECT_DIR / "assets" / "logo.png"
 USER_DATA_PATH = PROJECT_DIR / "user_data"
 CONTACT_HISTORY_PATH = PROJECT_DIR / "data" / "contact_history.jsonl"
 BOSS_DIGITS = str.maketrans(
@@ -735,6 +736,10 @@ class MainWindow(QMainWindow):
         """顶部：品牌信息 + 全局操作按钮，任何标签页下都能看到。"""
         header = QHBoxLayout()
         header.setSpacing(12)
+        logo = QLabel()
+        logo.setObjectName("logo")
+        logo.setPixmap(load_logo(34))
+        header.addWidget(logo, 0, Qt.AlignmentFlag.AlignVCenter)
         brand = QVBoxLayout()
         brand.setSpacing(1)
         title = QLabel("BossPilot")
@@ -1710,6 +1715,26 @@ QSpinBox::down-arrow:disabled { image: url(@arrow_down_muted@); }
 """
 
 
+def load_logo(height: int) -> QPixmap:
+    """按内容裁掉 logo 四周的透明边距，否则在标题栏里显得又小又偏。"""
+    image = QImage(str(LOGO_PATH))
+    if image.isNull():
+        return QPixmap()
+    image = image.convertToFormat(QImage.Format.Format_ARGB32)
+    step = max(1, image.width() // 128)
+    left, top, right, bottom = image.width(), image.height(), 0, 0
+    for y in range(0, image.height(), step):
+        for x in range(0, image.width(), step):
+            if image.pixelColor(x, y).alpha() > 8:
+                left, top = min(left, x), min(top, y)
+                right, bottom = max(right, x), max(bottom, y)
+    if left < right and top < bottom:
+        image = image.copy(left, top, right - left + step, bottom - top + step)
+    return QPixmap.fromImage(image).scaledToHeight(
+        height, Qt.TransformationMode.SmoothTransformation
+    )
+
+
 def build_stylesheet(icon_dir: Path | None = None) -> str:
     """生成完整样式表；箭头图标写盘失败时退回平台原生箭头。"""
     target = icon_dir or Path(QDir.tempPath()) / "bosspilot-icons"
@@ -1738,6 +1763,7 @@ def build_stylesheet(icon_dir: Path | None = None) -> str:
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("BossPilot")
+    app.setWindowIcon(QIcon(str(LOGO_PATH)))
     app.setStyleSheet(build_stylesheet())
     window = MainWindow()
     window.show()
