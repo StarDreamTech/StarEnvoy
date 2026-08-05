@@ -697,6 +697,17 @@ class MainWindow(QMainWindow):
     HISTORY_HEADERS = [caption for caption, _ in HISTORY_COLUMNS]
     HISTORY_STATUS_COLUMN = HISTORY_HEADERS.index("状态")
     TAB_FILTERS, TAB_RESULTS, TAB_HISTORY, TAB_CONSOLE = range(4)
+    # 状态卡下方常驻的条件胶囊：(键, 说明)，取值见 _filter_chip_values。
+    FILTER_CHIPS: tuple[tuple[str, str], ...] = (
+        ("city", "地区"),
+        ("query", "搜索词"),
+        ("keywords", "关键词"),
+        ("salary", "薪资"),
+        ("experience", "经验"),
+        ("education", "学历"),
+        ("detail", "详情"),
+        ("contact", "自动沟通"),
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -717,13 +728,23 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         layout.addLayout(self._build_header())
+        # 先建标签页：状态卡里的条件胶囊要读筛选控件的值。
+        tabs = self._build_tabs()
         layout.addWidget(self._build_status())
-        layout.addWidget(self._build_tabs(), 1)
+        layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
         self.login_button.clicked.connect(self.open_login)
         self.salary_mode.currentTextChanged.connect(self._sync_salary_enabled)
         self._sync_salary_enabled(self.salary_mode.currentText())
+        for control in self.filter_controls:
+            signal = getattr(control, "currentTextChanged", None) or getattr(
+                control, "textChanged", None
+            ) or getattr(control, "valueChanged", None) or getattr(
+                control, "toggled", None
+            )
+            signal.connect(self._refresh_filter_chips)
+        self._refresh_filter_chips()
         self.start_button.clicked.connect(self.start_search)
         self.stop_button.clicked.connect(self.stop_search)
         self.export_button.clicked.connect(self.export_csv)
@@ -771,6 +792,9 @@ class MainWindow(QMainWindow):
         """把筛选、结果、沟通记录、日志拆成四个标签页，避免挤在一屏。"""
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
+        # macOS 原生风格会把标签栏居中，文档模式下才是左对齐；
+        # 因此卡片描边画在各标签页自身（QWidget#tabPage）上。
+        self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._build_filters(), "采集设置")
         self.tabs.addTab(self._build_results(), "岗位结果")
         self.tabs.addTab(self._build_history(), "沟通记录")
@@ -814,7 +838,7 @@ class MainWindow(QMainWindow):
         self.filters = QWidget()
         self.filters.setObjectName("tabPage")
         page_layout = QVBoxLayout(self.filters)
-        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setContentsMargins(1, 1, 1, 1)
         page_layout.setSpacing(0)
         filter_body = QWidget()
         filter_body.setObjectName("filterBody")
@@ -935,36 +959,81 @@ class MainWindow(QMainWindow):
         page_layout.addWidget(hint)
         return self.filters
 
+    @staticmethod
+    def _chip(caption: str) -> tuple[QFrame, QLabel]:
+        """胶囊标签：左侧灰色说明，右侧深色取值。"""
+        chip = QFrame()
+        chip.setObjectName("statChip")
+        layout = QHBoxLayout(chip)
+        layout.setContentsMargins(10, 3, 10, 3)
+        layout.setSpacing(6)
+        caption_label = QLabel(caption)
+        caption_label.setObjectName("statCaption")
+        value_label = QLabel()
+        value_label.setObjectName("statValue")
+        layout.addWidget(caption_label)
+        layout.addWidget(value_label)
+        return chip, value_label
+
     def _build_status(self) -> QWidget:
+        """状态卡：上行是采集状态与计数，下行常驻显示当前筛选条件。"""
         self.status_panel = QFrame()
         self.status_panel.setObjectName("statusPanel")
-        status_layout = QHBoxLayout(self.status_panel)
-        status_layout.setContentsMargins(14, 9, 14, 9)
-        status_layout.setSpacing(10)
+        panel_layout = QVBoxLayout(self.status_panel)
+        panel_layout.setContentsMargins(14, 9, 14, 9)
+        panel_layout.setSpacing(9)
+
+        # 状态底色只染上半行，免得报错时整张卡片连筛选条件一起变红。
+        self.status_row = QFrame()
+        self.status_row.setObjectName("statusRow")
+        status_row = QHBoxLayout(self.status_row)
+        status_row.setContentsMargins(10, 5, 10, 5)
+        status_row.setSpacing(10)
         self.status_dot = QLabel()
         self.status_dot.setObjectName("statusDot")
         self.status_dot.setFixedSize(8, 8)
         self.status = QLabel("就绪")
         self.status.setObjectName("status")
-        status_layout.addWidget(self.status_dot)
-        status_layout.addWidget(self.status)
-        status_layout.addStretch()
-
+        status_row.addWidget(self.status_dot)
+        status_row.addWidget(self.status)
+        status_row.addStretch()
         self.stat_labels: dict[str, QLabel] = {}
-        for key, caption in (("scanned", "已读取"), ("matched", "已匹配"), ("contacted", "已沟通")):
-            chip = QFrame()
-            chip.setObjectName("statChip")
-            chip_layout = QHBoxLayout(chip)
-            chip_layout.setContentsMargins(10, 3, 10, 3)
-            chip_layout.setSpacing(6)
-            caption_label = QLabel(caption)
-            caption_label.setObjectName("statCaption")
-            value_label = QLabel("0")
-            value_label.setObjectName("statValue")
-            chip_layout.addWidget(caption_label)
-            chip_layout.addWidget(value_label)
-            status_layout.addWidget(chip)
+        for key, caption in (
+            ("scanned", "已读取"),
+            ("matched", "已匹配"),
+            ("contacted", "已沟通"),
+        ):
+            chip, value_label = self._chip(caption)
+            value_label.setText("0")
+            status_row.addWidget(chip)
             self.stat_labels[key] = value_label
+        panel_layout.addWidget(self.status_row)
+
+        divider = QFrame()
+        divider.setObjectName("hDivider")
+        divider.setFrameShape(QFrame.Shape.HLine)
+        panel_layout.addWidget(divider)
+
+        # 切到别的标签页时也要看得见条件，所以放在常驻的状态卡里。
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        caption = QLabel("当前筛选")
+        caption.setObjectName("barCaption")
+        filter_row.addWidget(caption)
+        self.filter_chips: dict[str, tuple[QFrame, QLabel]] = {}
+        for key, chip_caption in self.FILTER_CHIPS:
+            chip, value_label = self._chip(chip_caption)
+            filter_row.addWidget(chip)
+            self.filter_chips[key] = (chip, value_label)
+        filter_row.addStretch()
+        self.edit_filters_button = QPushButton("修改条件")
+        self.edit_filters_button.setObjectName("mini")
+        self.edit_filters_button.clicked.connect(
+            lambda: self.tabs.setCurrentIndex(self.TAB_FILTERS)
+        )
+        filter_row.addWidget(self.edit_filters_button)
+        panel_layout.addLayout(filter_row)
+
         self._set_status("就绪")
         return self.status_panel
 
@@ -1014,7 +1083,7 @@ class MainWindow(QMainWindow):
         results = QWidget()
         results.setObjectName("tabPage")
         results_layout = QVBoxLayout(results)
-        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setContentsMargins(1, 1, 1, 1)
         results_layout.setSpacing(0)
         self.result_count = QLabel("0 个结果")
         self.result_count.setObjectName("resultCount")
@@ -1039,13 +1108,6 @@ class MainWindow(QMainWindow):
                 self.clear_button,
             )
         )
-        # 结果与筛选条件分处两个标签页，这里回显本次采集用的条件。
-        self.filters_summary = QLabel()
-        self.filters_summary.setObjectName("filtersSummary")
-        self.filters_summary.setWordWrap(True)
-        self.filters_summary.hide()
-        results_layout.addWidget(self.filters_summary)
-
         self.results_stack = QStackedWidget()
         self.results_stack.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
@@ -1089,7 +1151,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("tabPage")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(1, 1, 1, 1)
         layout.setSpacing(0)
         self.history_count = QLabel("0 条记录")
         self.history_count.setObjectName("resultCount")
@@ -1123,7 +1185,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("tabPage")
         console_layout = QVBoxLayout(page)
-        console_layout.setContentsMargins(0, 0, 0, 0)
+        console_layout.setContentsMargins(1, 1, 1, 1)
         console_layout.setSpacing(0)
         clear_log = QPushButton("清空日志")
         clear_log.setObjectName("mini")
@@ -1167,8 +1229,6 @@ class MainWindow(QMainWindow):
             fetch_detail=self.fetch_detail.isChecked(),
         )
         self.clear_results()
-        self.filters_summary.setText(self._filters_summary_text())
-        self.filters_summary.show()
         self.tabs.setCurrentIndex(self.TAB_RESULTS)
         self.worker = JobWorker(options)
         self.worker.job_found.connect(self.add_job)
@@ -1335,7 +1395,7 @@ class MainWindow(QMainWindow):
         """更新状态文案与对应的视觉状态。"""
         self.status.setText(message)
         self.status.setToolTip(message)
-        for widget in (self.status_panel, self.status_dot):
+        for widget in (self.status_row, self.status_dot):
             widget.setProperty("state", state)
             widget.style().unpolish(widget)
             widget.style().polish(widget)
@@ -1350,27 +1410,59 @@ class MainWindow(QMainWindow):
         ):
             self.stat_labels[key].setText(str(value))
 
-    def _filters_summary_text(self) -> str:
-        """一行文字回显本次采集用的筛选条件。"""
-        salary = (
-            "不限"
-            if self.salary_mode.currentText() == "不限"
-            else f"{self.salary_mode.currentText()} {self.salary.value()}K"
-        )
-        return (
-            f"本次条件：{self.city.currentText()} | 搜索词：{self.query.text().strip() or '无'} | "
-            f"岗位关键词：{self.keywords.text().strip() or '无'}（{self.keyword_mode.currentText()}） | "
-            f"薪资：{salary} | 经验：{self.experience.currentText()} | "
-            f"学历：{self.education.currentText()} | "
-            f"岗位详情：{'读取' if self.fetch_detail.isChecked() else '跳过'} | "
-            f"自动沟通：{'开启' if self.auto_contact.isChecked() else '关闭'}"
-        )
+    def _filter_chip_values(self) -> dict[str, tuple[str, str]]:
+        """每个条件胶囊的 (显示文本, 悬停说明)。"""
+        keywords = parse_keywords(self.keywords.text())
+        query = self.query.text().strip()
+        salary_mode = self.salary_mode.currentText()
+        prefix = {"最低薪资不低于": "≥", "薪资范围包含": "含 "}.get(salary_mode, "")
+        return {
+            "city": (self.city.currentText(), "搜索城市"),
+            "query": (query or "未填写", f"BOSS 搜索词：{query or '未填写'}"),
+            "keywords": (
+                f"{len(keywords)} 个" if keywords else "不限",
+                "岗位名称需" + self.keyword_mode.currentText() + "：" + (
+                    "、".join(keywords) if keywords else "未填写，不做关键词过滤"
+                ),
+            ),
+            "salary": (
+                "不限" if salary_mode == "不限" else f"{prefix}{self.salary.value()}K",
+                f"薪资规则：{salary_mode}",
+            ),
+            "experience": (
+                self.experience.currentText(),
+                "我的工作经验；岗位要求不高于该档位即视为匹配",
+            ),
+            "education": (
+                self.education.currentText(),
+                "我的学历；岗位要求不高于该档位即视为匹配",
+            ),
+            "detail": (
+                "读取" if self.fetch_detail.isChecked() else "跳过",
+                "是否点开卡片读取列表页右侧的职位描述与 HR 信息",
+            ),
+            "contact": (
+                f"每 {self.contact_interval.value()} 秒"
+                if self.auto_contact.isChecked()
+                else "关闭",
+                "匹配后是否立即发起沟通",
+            ),
+        }
+
+    def _refresh_filter_chips(self, *_args: object) -> None:
+        """筛选控件一改动就刷新状态卡里的条件胶囊。"""
+        for key, (text, tip) in self._filter_chip_values().items():
+            chip, value_label = self.filter_chips[key]
+            display = text if len(text) <= 12 else f"{text[:11]}…"
+            value_label.setText(display)
+            chip.setToolTip(f"{tip}\n当前：{text}" if display != text else tip)
 
     @Slot(int)
     def _tab_changed(self, index: int) -> None:
         # 沟通记录在采集过程中会不断追加，每次切过来都重新读一遍文件。
         if index == self.TAB_HISTORY:
             self.load_history()
+        self.edit_filters_button.setVisible(index != self.TAB_FILTERS)
 
     @Slot()
     def load_history(self) -> None:
@@ -1481,6 +1573,8 @@ class MainWindow(QMainWindow):
         self._set_all_columns_visible(show_all)
         tab = settings.value("window/tab", self.TAB_FILTERS, type=int)
         self.tabs.setCurrentIndex(tab if 0 <= tab < self.tabs.count() else self.TAB_FILTERS)
+        # 索引没变化时 currentChanged 不会触发，这里显式同步一次。
+        self._tab_changed(self.tabs.currentIndex())
         geometry = settings.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
@@ -1580,26 +1674,26 @@ QLabel#fieldGroup { font-size: 11px; font-weight: 700; color: #8b98a5;
                     letter-spacing: 1px; padding-bottom: 2px; }
 QLabel#resultCount { color: #6b7a89; }
 QLabel#panelHint { color: #9aa7b4; font-size: 12px; }
+QLabel#barCaption { color: #8b98a5; font-size: 11px; font-weight: 700;
+                    letter-spacing: 1px; padding-right: 2px; }
 QLabel#pageHint { padding: 10px 20px; border-top: 1px solid #eef2f6;
                   background: #f9fbfc; color: #8b98a5; font-size: 12px;
                   border-bottom-left-radius: 10px;
                   border-bottom-right-radius: 10px; }
 
-QTabWidget#mainTabs::pane { border: 1px solid #dde5ee; border-radius: 10px;
-    background: #ffffff; top: -1px; }
+QTabWidget#mainTabs::pane { border: 0; background: transparent; }
 QTabBar { qproperty-drawBase: 0; }
-QTabBar::tab { min-height: 24px; padding: 6px 16px; margin: 0 4px 5px 0;
+QTabBar::tab { min-height: 24px; padding: 6px 16px; margin: 0 4px 6px 0;
     border: 1px solid transparent; border-radius: 8px; background: transparent;
     color: #6b7a89; font-weight: 600; }
 QTabBar::tab:hover { background: #eaf0f5; color: #33414d; }
-QTabBar::tab:selected { background: #ffffff; border-color: #e2e8f0;
+QTabBar::tab:selected { background: #ffffff; border-color: #dde5ee;
                         color: #0d7d8c; }
-QWidget#tabPage { background: transparent; }
+QWidget#tabPage { background: #ffffff; border: 1px solid #dde5ee;
+                  border-radius: 10px; }
 QFrame#vDivider { border: none; border-left: 1px solid #eef2f6;
                   max-width: 1px; margin: 4px 0; }
-QLabel#filtersSummary { padding: 8px 16px; border-top: 1px solid #eef2f6;
-                        border-bottom: 1px solid #eef2f6; background: #f9fbfc;
-                        color: #6b7a89; font-size: 12px; }
+QFrame#hDivider { border: none; border-top: 1px solid #eef2f6; max-height: 1px; }
 
 QLineEdit, QComboBox, QSpinBox {
     min-height: 31px; padding: 0 10px; border: 1px solid #d6dee8;
@@ -1646,11 +1740,13 @@ QPushButton#mini { min-height: 26px; padding: 0 11px; font-size: 12px;
                    color: #5a6b7b; }
 QPushButton#mini:hover { color: #1f2a37; }
 
-QFrame#statusPanel { border: 1px solid #e2e8f0; border-radius: 10px;
+QFrame#statusPanel { border: 1px solid #dde5ee; border-radius: 10px;
                      background: #ffffff; }
-QFrame#statusPanel[state="running"] { border-color: #b9dce1; background: #f2fafb; }
-QFrame#statusPanel[state="success"] { border-color: #b6ddc9; background: #f3fbf6; }
-QFrame#statusPanel[state="error"] { border-color: #eec6c5; background: #fdf5f5; }
+QFrame#statusRow { border: 1px solid transparent; border-radius: 7px;
+                   background: transparent; }
+QFrame#statusRow[state="running"] { border-color: #b9dce1; background: #f2fafb; }
+QFrame#statusRow[state="success"] { border-color: #b6ddc9; background: #f3fbf6; }
+QFrame#statusRow[state="error"] { border-color: #eec6c5; background: #fdf5f5; }
 QLabel#statusDot { border-radius: 4px; background: #a5b0bc; }
 QLabel#statusDot[state="running"] { background: #0d7d8c; }
 QLabel#statusDot[state="success"] { background: #12805c; }
