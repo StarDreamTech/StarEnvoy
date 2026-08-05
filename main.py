@@ -132,8 +132,8 @@ class SearchOptions:
     keyword_mode: str
     salary_k: int
     salary_mode: str
-    experience: str
-    education: str
+    experiences: tuple[str, ...]
+    educations: tuple[str, ...]
     max_results: int
     max_scrolls: int
     auto_contact: bool
@@ -166,6 +166,69 @@ class Job:
     benefits: str = ""
     address: str = ""
     detail_status: str = "未读取"
+
+
+class MultiSelectComboBox(QComboBox):
+    selection_changed = Signal()
+
+    def __init__(self, items: list[str], checked: tuple[str, ...]) -> None:
+        super().__init__()
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("不限")
+        self.setModel(QStandardItemModel(self))
+        self.view().pressed.connect(self._toggle_index)
+        self.currentIndexChanged.connect(lambda _index: self._refresh_text())
+        for text in items:
+            self.addItem(text)
+            item = self.model().item(self.count() - 1)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked if text in checked else Qt.CheckState.Unchecked
+            )
+        self.model().itemChanged.connect(lambda _item: self._refresh_text())
+        self._refresh_text()
+
+    def hidePopup(self) -> None:
+        if self.view().underMouse():
+            return
+        super().hidePopup()
+
+    def checked_texts(self) -> tuple[str, ...]:
+        return tuple(
+            self.itemText(index)
+            for index in range(self.count())
+            if self.model().item(index).checkState() == Qt.CheckState.Checked
+        )
+
+    def set_checked_texts(self, values: tuple[str, ...]) -> None:
+        selected = set(values)
+        for index in range(self.count()):
+            self.model().item(index).setCheckState(
+                Qt.CheckState.Checked
+                if self.itemText(index) in selected
+                else Qt.CheckState.Unchecked
+            )
+        self._refresh_text()
+
+    def _toggle_index(self, index: object) -> None:
+        item = self.model().item(index.row())
+        item.setCheckState(
+            Qt.CheckState.Unchecked
+            if item.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+
+    def _refresh_text(self) -> None:
+        values = self.checked_texts()
+        text = "、".join(values) if values else "不限"
+        self.lineEdit().setText(text)
+        self.setToolTip(text)
+        self.selection_changed.emit()
 
 
 SALARY_UNIT_SCALE = {"K": 1.0, "千": 1.0, "W": 10.0, "万": 10.0}
@@ -331,6 +394,19 @@ def _level_rejection_reason(
     return None
 
 
+def _multi_level_rejection_reason(
+    name: str, job_text: str, selected_values: tuple[str, ...], levels: dict[str, int]
+) -> str | None:
+    values = selected_values or ("不限",)
+    reasons = [
+        _level_rejection_reason(name, job_text, selected, levels)
+        for selected in values
+    ]
+    if any(reason is None for reason in reasons):
+        return None
+    return f"{name}不符：读取 {job_text or '空'}，要求 {'、'.join(values)}"
+
+
 def job_rejection_reason(job: Job, options: SearchOptions) -> str | None:
     title = job.title.casefold()
     keyword_hits = [keyword.casefold() in title for keyword in options.title_keywords]
@@ -350,10 +426,10 @@ def job_rejection_reason(job: Job, options: SearchOptions) -> str | None:
         if options.salary_mode == "薪资范围包含" and not low <= options.salary_k <= high:
             return f"{options.salary_k}K 不在 {low:g}-{high:g}K 范围内"
 
-    return _level_rejection_reason(
-        "经验", job.experience, options.experience, EXPERIENCE_LEVELS
-    ) or _level_rejection_reason(
-        "学历", job.education, options.education, EDUCATION_LEVELS
+    return _multi_level_rejection_reason(
+        "经验", job.experience, options.experiences, EXPERIENCE_LEVELS
+    ) or _multi_level_rejection_reason(
+        "学历", job.education, options.educations, EDUCATION_LEVELS
     )
 
 
@@ -401,8 +477,8 @@ def append_contact_history(
             "keyword_mode": options.keyword_mode,
             "salary_k": options.salary_k,
             "salary_mode": options.salary_mode,
-            "experience": options.experience,
-            "education": options.education,
+            "experiences": list(options.experiences),
+            "educations": list(options.educations),
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,7 +539,8 @@ class JobWorker(QThread):
                 f"地区={self.options.city} | 搜索词={self.options.query!r} | "
                 f"关键词={', '.join(self.options.title_keywords) or '无'} | "
                 f"模式={self.options.keyword_mode} | 薪资={self.options.salary_mode} {self.options.salary_k}K | "
-                f"经验={self.options.experience} | 学历={self.options.education}"
+                f"经验={'、'.join(self.options.experiences) or '不限'} | "
+                f"学历={'、'.join(self.options.educations) or '不限'}"
             )
 
             for round_number in range(self.options.max_scrolls):
@@ -840,10 +917,12 @@ class MainWindow(QMainWindow):
         self.salary_mode.currentTextChanged.connect(self._sync_salary_enabled)
         self._sync_salary_enabled(self.salary_mode.currentText())
         for control in self.filter_controls:
-            signal = getattr(control, "currentTextChanged", None) or getattr(
-                control, "textChanged", None
-            ) or getattr(control, "valueChanged", None) or getattr(
-                control, "toggled", None
+            signal = (
+                getattr(control, "selection_changed", None)
+                or getattr(control, "currentTextChanged", None)
+                or getattr(control, "textChanged", None)
+                or getattr(control, "valueChanged", None)
+                or getattr(control, "toggled", None)
             )
             signal.connect(self._refresh_filter_chips)
         self._refresh_filter_chips()
@@ -963,12 +1042,10 @@ class MainWindow(QMainWindow):
         self.salary.setSuffix(" K/月")
         self.salary_mode = QComboBox()
         self.salary_mode.addItems(SALARY_MODES)
-        self.experience = QComboBox()
-        self.experience.addItems(EXPERIENCES)
-        self.experience.setToolTip("岗位要求不高于所选档位即视为匹配，标注“经验不限”的岗位始终通过")
-        self.education = QComboBox()
-        self.education.addItems(EDUCATIONS)
-        self.education.setToolTip("岗位要求不高于所选学历即视为匹配，标注“学历不限”的岗位始终通过")
+        self.experience = MultiSelectComboBox(EXPERIENCES, ("1-3年",))
+        self.experience.setToolTip("可多选；岗位要求满足任一所选经验档位即通过")
+        self.education = MultiSelectComboBox(EDUCATIONS, ("本科",))
+        self.education.setToolTip("可多选；岗位要求满足任一所选学历档位即通过")
         self.max_results = QSpinBox()
         self.max_results.setRange(1, 1000)
         self.max_results.setValue(100)
@@ -1053,7 +1130,7 @@ class MainWindow(QMainWindow):
         page_layout.addWidget(filter_body)
         page_layout.addStretch()
         hint = QLabel(
-            "提示：经验与学历填你自己的条件，岗位要求不高于所选档位即视为匹配；"
+            "提示：经验与学历可多选，岗位要求满足任一所选档位即视为匹配；"
             "关闭“岗位详情”可以加快采集速度。设置会自动保存，下次启动沿用。"
         )
         hint.setObjectName("pageHint")
@@ -1325,8 +1402,8 @@ class MainWindow(QMainWindow):
             keyword_mode=self.keyword_mode.currentText(),
             salary_k=self.salary.value(),
             salary_mode=self.salary_mode.currentText(),
-            experience=self.experience.currentText(),
-            education=self.education.currentText(),
+            experiences=self.experience.checked_texts(),
+            educations=self.education.checked_texts(),
             max_results=self.max_results.value(),
             max_scrolls=self.max_scrolls.value(),
             auto_contact=self.auto_contact.isChecked(),
@@ -1535,12 +1612,12 @@ class MainWindow(QMainWindow):
                 f"薪资规则：{salary_mode}",
             ),
             "experience": (
-                self.experience.currentText(),
-                "我的工作经验；岗位要求不高于该档位即视为匹配",
+                "、".join(self.experience.checked_texts()) or "不限",
+                "我的工作经验；岗位要求满足任一所选档位即视为匹配",
             ),
             "education": (
-                self.education.currentText(),
-                "我的学历；岗位要求不高于该档位即视为匹配",
+                "、".join(self.education.checked_texts()) or "不限",
+                "我的学历；岗位要求满足任一所选档位即视为匹配",
             ),
             "detail": (
                 "读取" if self.fetch_detail.isChecked() else "跳过",
@@ -1650,19 +1727,37 @@ class MainWindow(QMainWindow):
         if link:
             QDesktopServices.openUrl(QUrl(link))
 
+    @staticmethod
+    def _settings_texts(value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return (value,) if value else ()
+        if isinstance(value, list):
+            return tuple(str(item) for item in value if str(item))
+        return ()
+
     def _load_settings(self) -> None:
         settings = QSettings("BossPilot", "BossPilot")
         controls = {
             "city": self.city,
             "keyword_mode": self.keyword_mode,
             "salary_mode": self.salary_mode,
-            "experience": self.experience,
-            "education": self.education,
         }
         for key, control in controls.items():
             value = settings.value(f"filters/{key}")
             if value is not None and control.findText(str(value)) >= 0:
                 control.setCurrentText(str(value))
+        self.experience.set_checked_texts(
+            self._settings_texts(settings.value("filters/experiences"))
+            or self._settings_texts(settings.value("filters/experience"))
+            or ("1-3年",)
+        )
+        self.education.set_checked_texts(
+            self._settings_texts(settings.value("filters/educations"))
+            or self._settings_texts(settings.value("filters/education"))
+            or ("本科",)
+        )
 
         self.query.setText(settings.value("filters/query", self.query.text(), type=str))
         self.keywords.setText(
@@ -1707,8 +1802,8 @@ class MainWindow(QMainWindow):
             "keyword_mode": self.keyword_mode.currentText(),
             "salary": self.salary.value(),
             "salary_mode": self.salary_mode.currentText(),
-            "experience": self.experience.currentText(),
-            "education": self.education.currentText(),
+            "experiences": list(self.experience.checked_texts()),
+            "educations": list(self.education.checked_texts()),
             "max_results": self.max_results.value(),
             "max_scrolls": self.max_scrolls.value(),
             "auto_contact": self.auto_contact.isChecked(),

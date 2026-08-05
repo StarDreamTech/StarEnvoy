@@ -26,8 +26,8 @@ def options(**changes: object) -> SearchOptions:
         "keyword_mode": "包含任一关键词",
         "salary_k": 12,
         "salary_mode": "最低薪资不低于",
-        "experience": "3-5年",
-        "education": "本科",
+        "experiences": ("3-5年",),
+        "educations": ("本科",),
         "max_results": 100,
         "max_scrolls": 30,
         "auto_contact": True,
@@ -101,8 +101,23 @@ def test_lower_requirements_are_accepted() -> None:
         "https://example.com",
     )
     assert job_matches(job, options())
-    assert not job_matches(job, options(experience="1年以内", education="大专"))
-    assert not job_matches(job, options(education="高中"))
+    assert not job_matches(job, options(experiences=("1年以内",), educations=("大专",)))
+    assert not job_matches(job, options(educations=("高中",)))
+
+
+def test_multiple_requirement_choices_are_or_matched() -> None:
+    job = Job(
+        "Python后端开发",
+        "12-20K",
+        "杭州·西湖区",
+        "3-5年",
+        "大专",
+        "示例科技",
+        "Python",
+        "https://example.com",
+    )
+    assert job_matches(job, options(experiences=("1-3年", "3-5年"), educations=("大专", "本科")))
+    assert not job_matches(job, options(experiences=("1年以内", "1-3年"), educations=("本科",)))
 
 
 def test_contact_actions() -> None:
