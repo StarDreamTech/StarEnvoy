@@ -3,13 +3,16 @@ from __future__ import annotations
 import csv
 import json
 import re
+import socket
 import sys
 import time
 from base64 import b64encode
+from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
+from urllib.request import urlopen
 
 from DrissionPage import Chromium, ChromiumOptions
 from PySide6.QtCore import QDir, QSettings, Qt, QThread, QUrl, Signal, Slot
@@ -100,8 +103,9 @@ CONTACT_STATUS_COLORS = {
 }
 PROJECT_DIR = Path(__file__).resolve().parent
 LOGO_PATH = PROJECT_DIR / "assets" / "logo.png"
-USER_DATA_PATH = PROJECT_DIR / "user_data"
 CONTACT_HISTORY_PATH = PROJECT_DIR / "data" / "contact_history.jsonl"
+BROWSER_PORT_PATH = PROJECT_DIR / "data" / "browser_port.txt"
+BROWSER_USER_DATA_PATH = PROJECT_DIR / "data" / "browser_user_data"
 BOSS_DIGITS = str.maketrans(
     {
         "\ue031": "0",
@@ -218,6 +222,46 @@ def parse_monthly_salary(text: str) -> tuple[float, float] | None:
 
 def decode_boss_text(text: str) -> str:
     return text.translate(BOSS_DIGITS)
+
+
+def devtools_alive(port: int) -> bool:
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.5) as response:
+            version = json.loads(response.read())
+        with urlopen(f"http://127.0.0.1:{port}/json", timeout=0.5) as response:
+            targets = json.loads(response.read())
+        return "webSocketDebuggerUrl" in version and any(
+            target.get("type") in {"page", "webview"} for target in targets
+        )
+    except Exception:
+        return False
+
+
+def free_local_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def boss_browser_options(
+    port_path: Path = BROWSER_PORT_PATH,
+    *,
+    port_factory: Callable[[], int] = free_local_port,
+    alive_check: Callable[[int], bool] = devtools_alive,
+) -> ChromiumOptions:
+    try:
+        saved_port = int(port_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        saved_port = 0
+
+    port = saved_port if saved_port and alive_check(saved_port) else port_factory()
+    port_path.parent.mkdir(parents=True, exist_ok=True)
+    port_path.write_text(str(port), encoding="utf-8")
+
+    co = ChromiumOptions()
+    co.set_user_data_path(str(BROWSER_USER_DATA_PATH))
+    co.set_local_port(port)
+    return co
 
 
 def parse_keywords(text: str) -> tuple[str, ...]:
@@ -354,10 +398,7 @@ class JobWorker(QThread):
         # 采集结束后不关闭浏览器，便于用户查看结果并保留登录状态。
         try:
             self.status_changed.emit("正在启动浏览器...")
-            co = ChromiumOptions()
-            co.set_user_data_path(str(USER_DATA_PATH))
-            co.set_local_port(9222)
-            browser = Chromium(addr_or_opts=co)
+            browser = Chromium(addr_or_opts=boss_browser_options())
             url = (
                 "https://www.zhipin.com/web/geek/jobs"
                 f"?query={quote(self.options.query)}&city={self.options.city_code}"
@@ -370,9 +411,15 @@ class JobWorker(QThread):
                 if self._stop_requested:
                     self.completed.emit(0)
                     return
+                if self._login_required(page):
+                    raise RuntimeError(
+                        "需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。"
+                    )
                 raise RuntimeError(
                     "两分钟内未读取到岗位列表。请确认已登录并完成安全验证，然后重试。"
                 )
+            if self._login_required(page):
+                raise RuntimeError("需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。")
 
             seen: set[str] = set()
             matched = 0
@@ -473,6 +520,19 @@ class JobWorker(QThread):
             self.completed.emit(matched)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    @staticmethod
+    def _login_required(page: object) -> bool:
+        script = r"""
+const text = document.body?.innerText || '';
+return /登录\s*\/\s*注册|登录BOSS|立即登录/.test(text)
+  || Array.from(document.querySelectorAll('a, button')).some(node =>
+    /登录\s*\/\s*注册|登录BOSS|立即登录/.test((node.innerText || '').trim()));
+"""
+        try:
+            return bool(page.run_js(script))
+        except Exception:
+            return False
 
     def _wait_for_cards(self, page: object) -> bool:
         for _ in range(120):
@@ -646,10 +706,7 @@ class LoginWorker(QThread):
 
     def run(self) -> None:
         try:
-            co = ChromiumOptions()
-            co.set_user_data_path(str(USER_DATA_PATH))
-            co.set_local_port(9222)
-            browser = Chromium(addr_or_opts=co)
+            browser = Chromium(addr_or_opts=boss_browser_options())
             browser.new_tab("https://www.zhipin.com/web/user/?ka=header-login")
             self.opened.emit()
         except Exception as exc:
@@ -778,7 +835,7 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         header.addWidget(self.progress, 0, Qt.AlignmentFlag.AlignVCenter)
         self.login_button = QPushButton("登录 BOSS")
-        self.login_button.setToolTip("打开 BOSS 登录页，登录状态保存在 user_data 目录")
+        self.login_button.setToolTip("打开 BOSS 登录页，登录状态保存在 data/browser_user_data 目录")
         self.start_button = QPushButton("开始采集")
         self.start_button.setObjectName("primary")
         self.stop_button = QPushButton("停止")
@@ -1259,7 +1316,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def login_opened(self) -> None:
         self._set_status("登录页已打开，请在浏览器中完成登录。", "success")
-        self.append_log("[登录] 已使用 user_data 打开 BOSS 登录页。")
+        self.append_log("[登录] 已打开 BOSS 登录页。")
 
     @Slot(str)
     def login_failed(self, message: str) -> None:

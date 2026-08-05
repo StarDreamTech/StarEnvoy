@@ -8,6 +8,7 @@ from main import (
     JobWorker,
     SearchOptions,
     append_contact_history,
+    boss_browser_options,
     decode_boss_text,
     job_matches,
     parse_keywords,
@@ -142,6 +143,38 @@ def test_contact_actions() -> None:
     assert JobWorker._contact(Page(True, old_button), job) == "此前已沟通"
     assert not old_button.clicked
     assert JobWorker._contact(Page(False, new_button), job) == "未找到岗位卡片"
+
+
+def test_login_required_detection() -> None:
+    class Page:
+        def __init__(self, value: bool) -> None:
+            self.value = value
+
+        def run_js(self, _script: str) -> bool:
+            return self.value
+
+    assert JobWorker._login_required(Page(True))
+    assert not JobWorker._login_required(Page(False))
+
+
+def test_cards_then_login_prompt_stops_before_collecting() -> None:
+    class Page:
+        checks = 0
+
+        def eles(self, *_args: object, **_kwargs: object) -> list[object]:
+            return [object()]
+
+        def run_js(self, _script: str) -> bool:
+            self.checks += 1
+            return self.checks > 1
+
+    worker = JobWorker(options())
+    main.time.sleep = lambda _seconds: None
+    page = Page()
+
+    assert worker._wait_for_cards(page)
+    assert not worker._login_required(page)
+    assert worker._login_required(page)
 
 
 def test_read_detail() -> None:

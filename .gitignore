@@ -7,4 +7,6 @@ __pycache__/
 .ruff_cache/
 browser_data/
 user_data/
+data/browser_port.txt
+data/browser_user_data/
 data/contact_history.jsonl
