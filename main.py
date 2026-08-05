@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -1266,12 +1267,9 @@ class MainWindow(QMainWindow):
         results_layout.setSpacing(0)
         self.result_count = QLabel("0 个结果")
         self.result_count.setObjectName("resultCount")
-        self.all_columns = QCheckBox("显示全部列")
-        self.all_columns.setToolTip(
-            "展开公司规模、融资阶段、HR 职位与活跃度、福利、工作地址等次要列。"
-            "隐藏的列同样会被采集并写入导出文件。"
+        self.result_columns_button = self._column_menu_button(
+            self.table, self.HEADERS, "result", self.OPTIONAL_COLUMNS
         )
-        self.all_columns.toggled.connect(self._set_all_columns_visible)
         self.export_button = QPushButton("导出 CSV")
         self.export_button.setObjectName("mini")
         self.export_button.setEnabled(False)
@@ -1281,7 +1279,7 @@ class MainWindow(QMainWindow):
         results_layout.addLayout(
             self._panel_header(
                 "双击一行打开岗位页，双击“职位描述”查看完整招聘要求",
-                self.all_columns,
+                self.result_columns_button,
                 self.result_count,
                 self.export_button,
                 self.clear_button,
@@ -1297,6 +1295,48 @@ class MainWindow(QMainWindow):
         self.results_stack.addWidget(self.table)
         results_layout.addWidget(self.results_stack, 1)
         return results
+
+    def _column_menu_button(
+        self,
+        table: QTableWidget,
+        headers: list[str],
+        settings_key: str,
+        default_hidden: tuple[str, ...],
+    ) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("mini")
+        button.setText("字段")
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setToolTip("隐藏录屏时不想展示的字段")
+        menu = QMenu(button)
+        settings = QSettings("BossPilot", "BossPilot")
+        saved = settings.value(f"columns/{settings_key}")
+        hidden = set(self._settings_texts(saved) if saved is not None else default_hidden)
+
+        for index, caption in enumerate(headers):
+            action = QAction(caption, menu)
+            action.setCheckable(True)
+            action.setChecked(caption not in hidden)
+            menu.addAction(action)
+
+            def toggle(
+                checked: bool,
+                *,
+                column: int = index,
+                current_action: QAction = action,
+            ) -> None:
+                visible = [item for item in menu.actions() if item is not current_action and item.isChecked()]
+                if not checked and not visible:
+                    current_action.setChecked(True)
+                    return
+                table.setColumnHidden(column, not checked)
+                self._save_column_visibility(settings_key, table, headers)
+
+            action.toggled.connect(toggle)
+            table.setColumnHidden(index, caption in hidden)
+
+        button.setMenu(menu)
+        return button
 
     def _build_history(self) -> QWidget:
         """沟通记录标签页：直接展示 JSONL 历史，不必再打开文件。"""
@@ -1337,6 +1377,9 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         self.history_count = QLabel("0 条记录")
         self.history_count.setObjectName("resultCount")
+        self.history_columns_button = self._column_menu_button(
+            self.history_table, self.HISTORY_HEADERS, "history", ()
+        )
         refresh = QPushButton("刷新")
         refresh.setObjectName("mini")
         refresh.clicked.connect(self.load_history)
@@ -1346,8 +1389,9 @@ class MainWindow(QMainWindow):
         open_file.clicked.connect(self.open_contact_history)
         layout.addLayout(
             self._panel_header(
-                "全部历史沟通，最近的排在最前；双击一行打开岗位页",
+                "全部历史沟通，最近的排在最前；双击一行查看详情，点“打开”跳转",
                 self.history_count,
+                self.history_columns_button,
                 refresh,
                 open_file,
             )
@@ -1551,17 +1595,23 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(running)
         self._sync_salary_enabled(self.salary_mode.currentText())
 
-    @Slot(bool)
-    def _set_all_columns_visible(self, visible: bool) -> None:
-        """切换次要列的显示；隐藏列不影响采集与导出。"""
-        for index, caption in enumerate(self.HEADERS):
-            if caption in self.OPTIONAL_COLUMNS:
-                self.table.setColumnHidden(index, not visible)
-
     @Slot(str)
     def _sync_salary_enabled(self, mode: str) -> None:
         """薪资规则选择“不限”时，目标月薪输入没有意义。"""
         self.salary.setEnabled(mode != "不限" and self.start_button.isEnabled())
+
+    @staticmethod
+    def _save_column_visibility(
+        settings_key: str, table: QTableWidget, headers: list[str]
+    ) -> None:
+        hidden = [
+            caption
+            for index, caption in enumerate(headers)
+            if table.isColumnHidden(index)
+        ]
+        settings = QSettings("BossPilot", "BossPilot")
+        settings.setValue(f"columns/{settings_key}", hidden)
+        settings.sync()
 
     def _update_results_state(self) -> None:
         """根据结果数量切换空状态与岗位表格。"""
@@ -1781,10 +1831,6 @@ class MainWindow(QMainWindow):
                 "filters/contact_interval", self.contact_interval.value(), type=int
             )
         )
-        # 显式同步一次：勾选状态未变化时 toggled 不会触发。
-        show_all = settings.value("window/all_columns", False, type=bool)
-        self.all_columns.setChecked(show_all)
-        self._set_all_columns_visible(show_all)
         tab = settings.value("window/tab", self.TAB_FILTERS, type=int)
         self.tabs.setCurrentIndex(tab if 0 <= tab < self.tabs.count() else self.TAB_FILTERS)
         # 索引没变化时 currentChanged 不会触发，这里显式同步一次。
@@ -1812,7 +1858,6 @@ class MainWindow(QMainWindow):
         }
         for key, value in values.items():
             settings.setValue(f"filters/{key}", value)
-        settings.setValue("window/all_columns", self.all_columns.isChecked())
         settings.setValue("window/tab", self.tabs.currentIndex())
         settings.setValue("window/geometry", self.saveGeometry())
         settings.sync()
@@ -1932,6 +1977,10 @@ QComboBox::drop-down { width: 22px; border: none; }
 QComboBox QAbstractItemView { border: 1px solid #d6dee8; border-radius: 8px;
     background: #ffffff; outline: none; selection-background-color: #e6f3f4;
     selection-color: #0f1b26; padding: 4px; }
+QMenu { border: 1px solid #d6dee8; border-radius: 8px; background: #ffffff;
+        padding: 5px; }
+QMenu::item { padding: 5px 18px 5px 8px; border-radius: 5px; }
+QMenu::item:selected { background: #e6f3f4; color: #0f1b26; }
 QSpinBox::up-button, QSpinBox::down-button { width: 20px; height: 13px;
     border: none; background: transparent; subcontrol-origin: border; }
 QSpinBox::up-button { subcontrol-position: top right; margin: 4px 5px 0 0; }
