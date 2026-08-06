@@ -17,6 +17,7 @@ from main import (
     refresh_hr_status,
     parse_keywords,
     parse_monthly_salary,
+    search_queries,
 )
 
 
@@ -66,6 +67,12 @@ def test_keyword_parser() -> None:
         "全栈",
         "Python后端",
     )
+
+
+def test_search_queries_include_title_keywords_once() -> None:
+    assert search_queries(
+        options(query=" Python ", title_keywords=("python", "全栈", "Python后端"))
+    ) == ("Python", "全栈", "Python后端")
 
 
 def test_job_filters() -> None:

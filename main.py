@@ -393,6 +393,18 @@ def parse_keywords(text: str) -> tuple[str, ...]:
     return tuple(word.strip() for word in re.split(r"[,，]", text) if word.strip())
 
 
+def search_queries(options: SearchOptions) -> tuple[str, ...]:
+    queries = []
+    seen = set()
+    for query in (options.query, *options.title_keywords):
+        query = query.strip()
+        key = query.casefold()
+        if query and key not in seen:
+            queries.append(query)
+            seen.add(key)
+    return tuple(queries)
+
+
 def _hr_kind(text: str) -> str:
     text = decode_boss_text(text).strip()
     if not text:
@@ -599,33 +611,10 @@ class JobWorker(QThread):
         try:
             self.status_changed.emit("正在启动浏览器...")
             browser = Chromium(addr_or_opts=boss_browser_options())
-            url = (
-                "https://www.zhipin.com/web/geek/jobs"
-                f"?query={quote(self.options.query)}&city={self.options.city_code}"
-            )
-            page = browser.new_tab(url)
-            self.status_changed.emit(
-                "等待岗位列表；如浏览器要求登录或验证，请在浏览器中完成。"
-            )
-            if not self._wait_for_cards(page):
-                if self._stop_requested:
-                    self.completed.emit(0)
-                    return
-                if self._login_required(page):
-                    raise RuntimeError(
-                        "需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。"
-                    )
-                raise RuntimeError(
-                    "两分钟内未读取到岗位列表。请确认已登录并完成安全验证，然后重试。"
-                )
-            if self._login_required(page):
-                raise RuntimeError("需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。")
-
             seen: set[str] = set()
             matched = 0
             contacted = 0
-            unchanged_rounds = 0
-            previous_count = 0
+            queries = search_queries(self.options)
             self.log_message.emit(
                 "[筛选条件] "
                 f"地区={self.options.city} | 搜索词={self.options.query!r} | "
@@ -637,50 +626,64 @@ class JobWorker(QThread):
                 f"HR活跃={self.options.hr_activity_mode}"
             )
 
-            for round_number in range(self.options.max_scrolls):
-                if self._stop_requested:
-                    break
-                try:
-                    cards = self._read_cards(page)
-                except Exception as exc:
-                    # 单轮读取失败（页面跳转、脚本执行超时等）不应终止整次采集。
-                    self.log_message.emit(f"[读取失败] 本轮跳过：{exc}")
-                    cards = []
-                for data in cards:
-                    raw_salary = data.get("salary", "")
-                    job = build_job(data)
-                    identity = job.link or f"{job.title}|{job.company}|{job.salary}"
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
-                    self.stats_changed.emit(len(seen), matched, contacted)
-                    raw_display = raw_salary.encode("unicode_escape").decode("ascii")
-                    self.log_message.emit(
-                        f"[读取] 岗位={job.title!r} | 薪资原文={raw_display!r} | "
-                        f"薪资解码={job.salary!r} | 地区={job.area!r} | "
-                        f"经验={job.experience!r} | 学历={job.education!r} | "
-                        f"公司={job.company!r} | 标签={job.tags!r} | "
-                        f"HR身份={job.hr_kind or '未知'} | "
-                        f"HR活跃级别={job.hr_activity_bucket or '未知'}"
+            for query in queries:
+                url = (
+                    "https://www.zhipin.com/web/geek/jobs"
+                    f"?query={quote(query)}&city={self.options.city_code}"
+                )
+                self.log_message.emit(f"[搜索] 正在搜索关键词={query!r}")
+                page = browser.new_tab(url)
+                self.status_changed.emit(
+                    f"等待岗位列表：{query}；如浏览器要求登录或验证，请在浏览器中完成。"
+                )
+                if not self._wait_for_cards(page):
+                    if self._stop_requested:
+                        break
+                    if self._login_required(page):
+                        raise RuntimeError(
+                            "需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。"
+                        )
+                    self.log_message.emit(f"[搜索失败] 未读取到岗位列表：{query}")
+                    continue
+                if self._login_required(page):
+                    raise RuntimeError(
+                        "需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。"
                     )
-                    reason = job_rejection_reason(job, self.options)
-                    if reason:
-                        self.log_message.emit(f"[跳过] {job.title} | 原因={reason}")
-                        continue
-                    hr_reason = hr_rejection_reason(job, self.options)
-                    if hr_reason:
-                        self.log_message.emit(f"[跳过] {job.title} | 原因={hr_reason}")
-                        try:
-                            record_skipped_job(job, self.options, hr_reason)
-                        except OSError as exc:
-                            self.log_message.emit(f"[记录失败] {exc}")
-                        continue
 
-                    self.log_message.emit(f"[匹配] {job.title} | {job.salary}")
-                    if self.options.fetch_detail:
-                        self.status_changed.emit(f"匹配 {job.title}，正在读取岗位详情...")
-                        job = replace(job, **self._read_detail(page, job))
-                        job = refresh_hr_status(job)
+                unchanged_rounds = 0
+                previous_count = len(seen)
+                reopened = False
+                round_number = 0
+                while round_number < self.options.max_scrolls:
+                    if self._stop_requested:
+                        break
+                    try:
+                        cards = self._read_cards(page)
+                    except Exception as exc:
+                        # 单轮读取失败（页面跳转、脚本执行超时等）不应终止整次采集。
+                        self.log_message.emit(f"[读取失败] 本轮跳过：{exc}")
+                        cards = []
+                    for data in cards:
+                        raw_salary = data.get("salary", "")
+                        job = build_job(data)
+                        identity = job.link or f"{job.title}|{job.company}|{job.salary}"
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        self.stats_changed.emit(len(seen), matched, contacted)
+                        raw_display = raw_salary.encode("unicode_escape").decode("ascii")
+                        self.log_message.emit(
+                            f"[读取] 岗位={job.title!r} | 薪资原文={raw_display!r} | "
+                            f"薪资解码={job.salary!r} | 地区={job.area!r} | "
+                            f"经验={job.experience!r} | 学历={job.education!r} | "
+                            f"公司={job.company!r} | 标签={job.tags!r} | "
+                            f"HR身份={job.hr_kind or '未知'} | "
+                            f"HR活跃级别={job.hr_activity_bucket or '未知'}"
+                        )
+                        reason = job_rejection_reason(job, self.options)
+                        if reason:
+                            self.log_message.emit(f"[跳过] {job.title} | 原因={reason}")
+                            continue
                         hr_reason = hr_rejection_reason(job, self.options)
                         if hr_reason:
                             self.log_message.emit(f"[跳过] {job.title} | 原因={hr_reason}")
@@ -689,56 +692,94 @@ class JobWorker(QThread):
                             except OSError as exc:
                                 self.log_message.emit(f"[记录失败] {exc}")
                             continue
-                        self.log_message.emit(
-                            f"[详情] {job.title} | 状态={job.detail_status} | "
-                            f"技能={job.skills or '空'} | 福利={job.benefits or '空'} | "
-                            f"地址={job.address or '空'} | "
-                            f"HR={job.hr_name or '空'}（{job.hr_title or '未知'}，"
-                            f"{job.hr_active or '活跃度未知'}，{job.hr_kind or '身份未知'}，"
-                            f"{job.hr_activity_bucket or '活跃未知'}） | "
-                            f"描述{len(job.description)} 字"
-                        )
-                    if self.options.auto_contact:
-                        self.status_changed.emit(
-                            f"匹配 {job.title}，正在发起沟通..."
-                        )
-                        job = replace(job, contact_status=self._contact(page, job))
-                        self.log_message.emit(
-                            f"[沟通] {job.title} | 状态={job.contact_status}"
-                        )
+
+                        self.log_message.emit(f"[匹配] {job.title} | {job.salary}")
+                        if self.options.fetch_detail:
+                            self.status_changed.emit(f"匹配 {job.title}，正在读取岗位详情...")
+                            job = replace(job, **self._read_detail(page, job))
+                            job = refresh_hr_status(job)
+                            hr_reason = hr_rejection_reason(job, self.options)
+                            if hr_reason:
+                                self.log_message.emit(f"[跳过] {job.title} | 原因={hr_reason}")
+                                try:
+                                    record_skipped_job(job, self.options, hr_reason)
+                                except OSError as exc:
+                                    self.log_message.emit(f"[记录失败] {exc}")
+                                continue
+                            self.log_message.emit(
+                                f"[详情] {job.title} | 状态={job.detail_status} | "
+                                f"技能={job.skills or '空'} | 福利={job.benefits or '空'} | "
+                                f"地址={job.address or '空'} | "
+                                f"HR={job.hr_name or '空'}（{job.hr_title or '未知'}，"
+                                f"{job.hr_active or '活跃度未知'}，{job.hr_kind or '身份未知'}，"
+                                f"{job.hr_activity_bucket or '活跃未知'}） | "
+                                f"描述{len(job.description)} 字"
+                            )
+                        if self.options.auto_contact:
+                            self.status_changed.emit(
+                                f"匹配 {job.title}，正在发起沟通..."
+                            )
+                            job = replace(job, contact_status=self._contact(page, job))
+                            self.log_message.emit(
+                                f"[沟通] {job.title} | 状态={job.contact_status}"
+                            )
+                            if job.contact_status in {"已发起沟通", "此前已沟通"}:
+                                try:
+                                    append_contact_history(job, self.options)
+                                    self.log_message.emit(
+                                        f"[记录] 已写入沟通历史：{CONTACT_HISTORY_PATH}"
+                                    )
+                                except OSError as exc:
+                                    self.log_message.emit(f"[记录失败] {exc}")
+                        self.job_found.emit(job)
+                        matched += 1
                         if job.contact_status in {"已发起沟通", "此前已沟通"}:
-                            try:
-                                append_contact_history(job, self.options)
-                                self.log_message.emit(
-                                    f"[记录] 已写入沟通历史：{CONTACT_HISTORY_PATH}"
-                                )
-                            except OSError as exc:
-                                self.log_message.emit(f"[记录失败] {exc}")
-                    self.job_found.emit(job)
-                    matched += 1
-                    if job.contact_status in {"已发起沟通", "此前已沟通"}:
-                        contacted += 1
-                    self.stats_changed.emit(len(seen), matched, contacted)
+                            contacted += 1
+                        self.stats_changed.emit(len(seen), matched, contacted)
+                        if matched >= self.options.max_results:
+                            break
+                        if self.options.auto_contact and job.contact_status == "已发起沟通":
+                            self._wait_contact_interval()
+                    self.status_changed.emit(
+                        f"已读取 {len(seen)} 个岗位，匹配 {matched} 个（{query} 第 {round_number + 1} 轮）"
+                    )
                     if matched >= self.options.max_results:
                         break
-                    if self.options.auto_contact and job.contact_status == "已发起沟通":
-                        self._wait_contact_interval()
-                self.status_changed.emit(
-                    f"已读取 {len(seen)} 个岗位，匹配 {matched} 个（第 {round_number + 1} 轮）"
-                )
-                if matched >= self.options.max_results:
-                    break
 
-                unchanged_rounds = unchanged_rounds + 1 if len(seen) == previous_count else 0
-                if unchanged_rounds >= 3:
+                    unchanged_rounds = unchanged_rounds + 1 if len(seen) == previous_count else 0
+                    if unchanged_rounds >= 3:
+                        if reopened:
+                            break
+                        self.log_message.emit(f"[刷新] 列表不再追加，重新打开搜索页：{query}")
+                        page = browser.new_tab(url)
+                        if not self._wait_for_cards(page):
+                            if self._stop_requested:
+                                break
+                            if self._login_required(page):
+                                raise RuntimeError(
+                                    "需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。"
+                                )
+                            self.log_message.emit(f"[搜索失败] 重开后仍未读取到岗位列表：{query}")
+                            break
+                        if self._login_required(page):
+                            raise RuntimeError(
+                                "需要登录 BOSS：请点击“登录 BOSS”完成登录后再开始采集。"
+                            )
+                        reopened = True
+                        unchanged_rounds = 0
+                        previous_count = len(seen)
+                        round_number += 1
+                        continue
+                    previous_count = len(seen)
+                    page.run_js(
+                        "const box=document.querySelector('.job-list-container,.job-list-box');"
+                        "if(box){box.scrollTop=box.scrollHeight;}"
+                        "window.scrollTo(0,document.body.scrollHeight);"
+                    )
+                    time.sleep(1.5)
+                    round_number += 1
+                if self._stop_requested or matched >= self.options.max_results:
                     break
-                previous_count = len(seen)
-                page.run_js(
-                    "const box=document.querySelector('.job-list-container,.job-list-box');"
-                    "if(box){box.scrollTop=box.scrollHeight;}"
-                    "window.scrollTo(0,document.body.scrollHeight);"
-                )
-                time.sleep(1.5)
 
             self.completed.emit(matched)
         except Exception as exc:
