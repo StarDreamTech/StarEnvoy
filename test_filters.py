@@ -3,6 +3,7 @@ import json
 from dataclasses import replace
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from PySide6.QtWidgets import QApplication
 from main import (
     Job,
     JobWorker,
@@ -337,3 +338,10 @@ def test_contact_history() -> None:
         assert records[1]["contacted_at"] is None
         assert records[0]["title"] == "Python后端"
         assert records[0]["search"]["title_keywords"] == ["全栈", "Python后端"]
+
+
+def test_main_window_initializes() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = main.MainWindow()
+    assert window.table.columnCount() == len(window.HEADERS)
+    window.close()

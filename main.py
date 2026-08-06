@@ -1348,6 +1348,8 @@ class MainWindow(QMainWindow):
             "HR": 90,
             "HR 职位": 90,
             "HR 活跃": 90,
+            "HR 身份": 90,
+            "HR 活跃级别": 110,
             "技能要求": 200,
             "福利": 160,
             "工作地址": 180,
@@ -1356,7 +1358,7 @@ class MainWindow(QMainWindow):
             "沟通状态": 110,
         }
         for index, caption in enumerate(self.HEADERS):
-            self.table.setColumnWidth(index, widths[caption])
+            self.table.setColumnWidth(index, widths.get(caption, 120))
             if caption in self.OPTIONAL_COLUMNS:
                 self.table.setColumnHidden(index, True)
 
@@ -1467,7 +1469,9 @@ class MainWindow(QMainWindow):
             self.HISTORY_OPEN_COLUMN, QHeaderView.ResizeMode.Fixed
         )
         history_header.setStretchLastSection(False)
-        for index, width in enumerate((165, 210, 100, 140, 180, 150, 100, 150, 260, 80)):
+        for index, width in enumerate(
+            (165, 210, 100, 140, 180, 150, 90, 110, 100, 150, 260, 80)
+        ):
             self.history_table.setColumnWidth(index, width)
 
         page = QWidget()
