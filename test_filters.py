@@ -14,6 +14,7 @@ from main import (
     job_from_history_record,
     job_matches,
     hr_rejection_reason,
+    refresh_hr_status,
     parse_keywords,
     parse_monthly_salary,
 )
@@ -78,14 +79,45 @@ def test_job_filters() -> None:
 
 def test_hr_filters_skip_headhunters_and_stale_activity() -> None:
     assert hr_rejection_reason(
-        Job("Python后端", hr_title="猎头顾问", hr_kind="猎头", hr_active="刚刚活跃", hr_activity_bucket="最近活跃")
+        Job("Python后端", hr_title="猎头顾问", hr_kind="猎头", hr_active="刚刚活跃", hr_activity_bucket="最近活跃"),
+        options(),
     ) == "HR 身份为猎头：猎头顾问"
     assert hr_rejection_reason(
-        Job("Python后端", hr_title="招聘者", hr_kind="招聘方", hr_active="几个月前活跃", hr_activity_bucket="较久活跃")
-    ) == "HR 活跃状态过旧：几个月前活跃"
+        Job("Python后端", hr_title="招聘者", hr_kind="招聘方", hr_active="半年前活跃", hr_activity_bucket="较久活跃"),
+        options(),
+    ) == "HR 活跃状态不够新：半年前活跃"
     assert hr_rejection_reason(
-        Job("Python后端", hr_title="招聘者", hr_kind="招聘方", hr_active="本周活跃", hr_activity_bucket="最近活跃")
+        Job("Python后端", hr_title="招聘者", hr_kind="招聘方", hr_active="近半年活跃", hr_activity_bucket="半年活跃"),
+        options(),
+    ) == "HR 活跃状态不够新：近半年活跃"
+    assert hr_rejection_reason(
+        Job("Python后端", hr_title="招聘者", hr_kind="招聘方", hr_active="本周活跃", hr_activity_bucket="最近活跃"),
+        options(),
     ) is None
+
+
+def test_hr_filters_are_configurable() -> None:
+    headhunter = Job("Python后端", hr_title="猎头顾问", hr_kind="猎头")
+    stale = Job("Python后端", hr_title="招聘者", hr_active="半年前活跃", hr_activity_bucket="较久活跃")
+    half_year = Job("Python后端", hr_title="招聘者", hr_active="近半年活跃", hr_activity_bucket="半年活跃")
+    assert hr_rejection_reason(headhunter, options(skip_headhunters=False)) is None
+    assert hr_rejection_reason(half_year, options(hr_activity_mode="跳过较久活跃")) is None
+    assert hr_rejection_reason(stale, options(hr_activity_mode="跳过较久活跃")) == "HR 活跃状态过旧：半年前活跃"
+    assert hr_rejection_reason(stale, options(hr_activity_mode="不限")) is None
+
+
+def test_detail_hr_activity_recomputes_unknown_bucket() -> None:
+    job = refresh_hr_status(
+        Job(
+            "Python后端",
+            hr_title="招聘者",
+            hr_active="半年前活跃",
+            hr_kind="招聘方",
+            hr_activity_bucket="未知",
+        )
+    )
+    assert job.hr_activity_bucket == "较久活跃"
+    assert hr_rejection_reason(job, options()) == "HR 活跃状态不够新：半年前活跃"
 
 
 def test_unlimited_requirements_are_accepted() -> None:

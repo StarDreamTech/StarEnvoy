@@ -72,6 +72,7 @@ EXPERIENCES = [
 ]
 EDUCATIONS = ["不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"]
 SALARY_MODES = ["最低薪资不低于", "薪资范围包含", "不限"]
+HR_ACTIVITY_MODES = ["仅最近活跃", "跳过较久活跃", "不限"]
 # 档位越大要求越高；岗位要求不高于所选档位即视为匹配。
 EXPERIENCE_LEVELS = {
     "在校/应届": 0,
@@ -104,6 +105,7 @@ CONTACT_STATUS_COLORS = {
     "未沟通": "#8b98a5",
     "跳过：猎头": "#9f1239",
     "跳过：HR 活跃过旧": "#b45309",
+    "跳过：HR 活跃不符": "#b45309",
 }
 PROJECT_DIR = Path(__file__).resolve().parent
 LOGO_PATH = PROJECT_DIR / "assets" / "logo.png"
@@ -129,9 +131,12 @@ HR_RECENT_ACTIVITY_RE = re.compile(
     r"(刚刚(?:活跃|在线)|今日(?:活跃|在线)|本周(?:活跃|在线)|本月(?:活跃|在线)|"
     r"最近(?:活跃|在线)|\d+(?:分钟|小时|天|周)内(?:活跃|在线))"
 )
+HR_HALF_YEAR_ACTIVITY_RE = re.compile(
+    r"(\d+(?:个)?月内(?:活跃|在线)|半年(?:内)?(?:活跃|在线)|近半年(?:活跃|在线))"
+)
 HR_STALE_ACTIVITY_RE = re.compile(
-    r"(\d+(?:个)?月(?:前|内)?(?:活跃|在线)|几个月前(?:活跃|在线)|"
-    r"半年(?:前|内)?(?:活跃|在线)|近半年(?:活跃|在线)|活跃于[^\n]*)"
+    r"(\d+(?:个)?月前(?:活跃|在线)|几个月前(?:活跃|在线)|"
+    r"半年前(?:活跃|在线)|活跃于[^\n]*)"
 )
 
 
@@ -151,6 +156,8 @@ class SearchOptions:
     auto_contact: bool
     contact_interval: int
     fetch_detail: bool = True
+    skip_headhunters: bool = True
+    hr_activity_mode: str = "仅最近活跃"
 
 
 @dataclass(frozen=True)
@@ -403,8 +410,10 @@ def _hr_activity_bucket(text: str) -> str:
         return ""
     if HR_STALE_ACTIVITY_RE.search(text):
         return "较久活跃"
+    if HR_HALF_YEAR_ACTIVITY_RE.search(text):
+        return "半年活跃"
     if HR_RECENT_ACTIVITY_RE.search(text):
-        return "半年活跃" if ("半年" in text or "月内" in text) else "最近活跃"
+        return "最近活跃"
     if "活跃" in text and "前" not in text:
         return "最近活跃"
     return "未知"
@@ -480,12 +489,31 @@ def job_rejection_reason(job: Job, options: SearchOptions) -> str | None:
     )
 
 
-def hr_rejection_reason(job: Job) -> str | None:
-    if job.hr_kind == "猎头":
+def hr_rejection_reason(job: Job, options: SearchOptions) -> str | None:
+    if options.skip_headhunters and job.hr_kind == "猎头":
         return f"HR 身份为猎头：{job.hr_title or job.hr_name or '空'}"
-    if job.hr_activity_bucket == "较久活跃":
+    if options.hr_activity_mode == "仅最近活跃" and job.hr_activity_bucket in {
+        "半年活跃",
+        "较久活跃",
+    }:
+        return f"HR 活跃状态不够新：{job.hr_active or '空'}"
+    if options.hr_activity_mode == "跳过较久活跃" and job.hr_activity_bucket == "较久活跃":
         return f"HR 活跃状态过旧：{job.hr_active or '空'}"
     return None
+
+
+def refresh_hr_status(job: Job) -> Job:
+    hr_text = " ".join(
+        part for part in (job.hr_name, job.hr_title, job.hr_active) if part
+    )
+    values = {}
+    hr_kind = _hr_kind(hr_text)
+    if hr_kind and (job.hr_kind in {"", "未知"} or hr_kind == "猎头"):
+        values["hr_kind"] = hr_kind
+    activity_bucket = _hr_activity_bucket(job.hr_active)
+    if activity_bucket:
+        values["hr_activity_bucket"] = activity_bucket
+    return replace(job, **values) if values else job
 
 
 def job_matches(job: Job, options: SearchOptions) -> bool:
@@ -536,6 +564,8 @@ def append_contact_history(
             "salary_mode": options.salary_mode,
             "experiences": list(options.experiences),
             "educations": list(options.educations),
+            "skip_headhunters": options.skip_headhunters,
+            "hr_activity_mode": options.hr_activity_mode,
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,8 +573,8 @@ def append_contact_history(
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def record_skipped_job(job: Job, options: SearchOptions) -> None:
-    status = "跳过：猎头" if job.hr_kind == "猎头" else "跳过：HR 活跃过旧"
+def record_skipped_job(job: Job, options: SearchOptions, reason: str) -> None:
+    status = "跳过：猎头" if "猎头" in reason else "跳过：HR 活跃不符"
     append_contact_history(replace(job, contact_status=status), options)
 
 
@@ -602,7 +632,9 @@ class JobWorker(QThread):
                 f"关键词={', '.join(self.options.title_keywords) or '无'} | "
                 f"模式={self.options.keyword_mode} | 薪资={self.options.salary_mode} {self.options.salary_k}K | "
                 f"经验={'、'.join(self.options.experiences) or '不限'} | "
-                f"学历={'、'.join(self.options.educations) or '不限'}"
+                f"学历={'、'.join(self.options.educations) or '不限'} | "
+                f"跳过猎头={'是' if self.options.skip_headhunters else '否'} | "
+                f"HR活跃={self.options.hr_activity_mode}"
             )
 
             for round_number in range(self.options.max_scrolls):
@@ -635,11 +667,11 @@ class JobWorker(QThread):
                     if reason:
                         self.log_message.emit(f"[跳过] {job.title} | 原因={reason}")
                         continue
-                    hr_reason = hr_rejection_reason(job)
+                    hr_reason = hr_rejection_reason(job, self.options)
                     if hr_reason:
                         self.log_message.emit(f"[跳过] {job.title} | 原因={hr_reason}")
                         try:
-                            record_skipped_job(job, self.options)
+                            record_skipped_job(job, self.options, hr_reason)
                         except OSError as exc:
                             self.log_message.emit(f"[记录失败] {exc}")
                         continue
@@ -648,17 +680,12 @@ class JobWorker(QThread):
                     if self.options.fetch_detail:
                         self.status_changed.emit(f"匹配 {job.title}，正在读取岗位详情...")
                         job = replace(job, **self._read_detail(page, job))
-                        if not job.hr_kind:
-                            job = replace(job, hr_kind=_hr_kind(" ".join(
-                                part for part in (job.hr_name, job.hr_title, job.hr_active) if part
-                            )))
-                        if not job.hr_activity_bucket:
-                            job = replace(job, hr_activity_bucket=_hr_activity_bucket(job.hr_active))
-                        hr_reason = hr_rejection_reason(job)
+                        job = refresh_hr_status(job)
+                        hr_reason = hr_rejection_reason(job, self.options)
                         if hr_reason:
                             self.log_message.emit(f"[跳过] {job.title} | 原因={hr_reason}")
                             try:
-                                record_skipped_job(job, self.options)
+                                record_skipped_job(job, self.options, hr_reason)
                             except OSError as exc:
                                 self.log_message.emit(f"[记录失败] {exc}")
                             continue
@@ -984,6 +1011,8 @@ class MainWindow(QMainWindow):
         ("salary", "薪资"),
         ("experience", "经验"),
         ("education", "学历"),
+        ("headhunter", "猎头"),
+        ("hr_active", "HR 活跃"),
         ("detail", "详情"),
         ("contact", "自动沟通"),
     )
@@ -1165,6 +1194,14 @@ class MainWindow(QMainWindow):
             "点击匹配到的岗位卡片，读取列表页右侧的职位描述、技能标签、福利、地址与 HR 信息。"
             "关闭可以加快采集速度。"
         )
+        self.skip_headhunters = QCheckBox("跳过猎头")
+        self.skip_headhunters.setChecked(True)
+        self.skip_headhunters.setToolTip("识别到 HR 身份为猎头时跳过，并写入沟通记录")
+        self.hr_activity_mode = QComboBox()
+        self.hr_activity_mode.addItems(HR_ACTIVITY_MODES)
+        self.hr_activity_mode.setToolTip(
+            "仅最近活跃：跳过半年/较久活跃；跳过较久活跃：允许半年活跃；不限：不按 HR 活跃筛选"
+        )
 
         groups = [
             (
@@ -1192,6 +1229,8 @@ class MainWindow(QMainWindow):
                     ("最多加载轮数", self.max_scrolls),
                     ("沟通间隔", self.contact_interval),
                     ("岗位详情", self.fetch_detail),
+                    ("猎头过滤", self.skip_headhunters),
+                    ("HR 活跃", self.hr_activity_mode),
                     ("自动沟通", self.auto_contact),
                 ],
             ),
@@ -1557,6 +1596,8 @@ class MainWindow(QMainWindow):
             auto_contact=self.auto_contact.isChecked(),
             contact_interval=self.contact_interval.value(),
             fetch_detail=self.fetch_detail.isChecked(),
+            skip_headhunters=self.skip_headhunters.isChecked(),
+            hr_activity_mode=self.hr_activity_mode.currentText(),
         )
         self.clear_results()
         self.tabs.setCurrentIndex(self.TAB_RESULTS)
@@ -1773,6 +1814,14 @@ class MainWindow(QMainWindow):
                 "、".join(self.education.checked_texts()) or "不限",
                 "我的学历；岗位要求满足任一所选档位即视为匹配",
             ),
+            "headhunter": (
+                "跳过" if self.skip_headhunters.isChecked() else "不限",
+                "是否跳过 HR 身份为猎头的岗位",
+            ),
+            "hr_active": (
+                self.hr_activity_mode.currentText(),
+                "HR 活跃状态筛选",
+            ),
             "detail": (
                 "读取" if self.fetch_detail.isChecked() else "跳过",
                 "是否点开卡片读取列表页右侧的职位描述与 HR 信息",
@@ -1901,6 +1950,7 @@ class MainWindow(QMainWindow):
             "city": self.city,
             "keyword_mode": self.keyword_mode,
             "salary_mode": self.salary_mode,
+            "hr_activity_mode": self.hr_activity_mode,
         }
         for key, control in controls.items():
             value = settings.value(f"filters/{key}")
@@ -1934,6 +1984,9 @@ class MainWindow(QMainWindow):
         self.fetch_detail.setChecked(
             settings.value("filters/fetch_detail", True, type=bool)
         )
+        self.skip_headhunters.setChecked(
+            settings.value("filters/skip_headhunters", True, type=bool)
+        )
         self.contact_interval.setValue(
             settings.value(
                 "filters/contact_interval", self.contact_interval.value(), type=int
@@ -1963,6 +2016,8 @@ class MainWindow(QMainWindow):
             "auto_contact": self.auto_contact.isChecked(),
             "contact_interval": self.contact_interval.value(),
             "fetch_detail": self.fetch_detail.isChecked(),
+            "skip_headhunters": self.skip_headhunters.isChecked(),
+            "hr_activity_mode": self.hr_activity_mode.currentText(),
         }
         for key, value in values.items():
             settings.setValue(f"filters/{key}", value)
