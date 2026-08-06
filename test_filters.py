@@ -12,6 +12,7 @@ from main import (
     decode_boss_text,
     job_from_history_record,
     job_matches,
+    hr_rejection_reason,
     parse_keywords,
     parse_monthly_salary,
 )
@@ -72,6 +73,18 @@ def test_job_filters() -> None:
     assert job_matches(job, options(salary_k=15, salary_mode="薪资范围包含"))
     assert job_matches(job, options(title_keywords=("PYTHON后端",)))
     assert job_matches(job, options(title_keywords=("python后端",)))
+
+
+def test_hr_filters_skip_headhunters_and_stale_activity() -> None:
+    assert hr_rejection_reason(
+        Job("Python后端", hr_title="猎头顾问", hr_kind="猎头", hr_active="刚刚活跃", hr_activity_bucket="最近活跃")
+    ) == "HR 身份为猎头：猎头顾问"
+    assert hr_rejection_reason(
+        Job("Python后端", hr_title="招聘者", hr_kind="招聘方", hr_active="几个月前活跃", hr_activity_bucket="较久活跃")
+    ) == "HR 活跃状态过旧：几个月前活跃"
+    assert hr_rejection_reason(
+        Job("Python后端", hr_title="招聘者", hr_kind="招聘方", hr_active="本周活跃", hr_activity_bucket="最近活跃")
+    ) is None
 
 
 def test_unlimited_requirements_are_accepted() -> None:
@@ -271,6 +284,23 @@ def test_history_record_keeps_detail_description() -> None:
     assert job.detail_status == "已读取"
     assert job.address == "杭州钱塘区"
     assert job.hr_name == "沈盼盼"
+
+
+def test_history_record_keeps_hr_status_fields() -> None:
+    job = job_from_history_record(
+        {
+            "title": "Python后端",
+            "hr": {
+                "name": "沈盼盼",
+                "title": "招聘者",
+                "active": "本周活跃",
+                "kind": "招聘方",
+                "activity_bucket": "最近活跃",
+            },
+        }
+    )
+    assert job.hr_kind == "招聘方"
+    assert job.hr_activity_bucket == "最近活跃"
 
 
 def test_browser_options_reuses_only_live_saved_port() -> None:

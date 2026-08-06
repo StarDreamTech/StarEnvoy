@@ -102,6 +102,8 @@ CONTACT_STATUS_COLORS = {
     "已发起沟通": "#0f7a58",
     "此前已沟通": "#5a6b7b",
     "未沟通": "#8b98a5",
+    "跳过：猎头": "#9f1239",
+    "跳过：HR 活跃过旧": "#b45309",
 }
 PROJECT_DIR = Path(__file__).resolve().parent
 LOGO_PATH = PROJECT_DIR / "assets" / "logo.png"
@@ -121,6 +123,15 @@ BOSS_DIGITS = str.maketrans(
         "\ue039": "8",
         "\ue03a": "9",
     }
+)
+HR_HEADHUNTER_RE = re.compile(r"猎头")
+HR_RECENT_ACTIVITY_RE = re.compile(
+    r"(刚刚(?:活跃|在线)|今日(?:活跃|在线)|本周(?:活跃|在线)|本月(?:活跃|在线)|"
+    r"最近(?:活跃|在线)|\d+(?:分钟|小时|天|周)内(?:活跃|在线))"
+)
+HR_STALE_ACTIVITY_RE = re.compile(
+    r"(\d+(?:个)?月(?:前|内)?(?:活跃|在线)|几个月前(?:活跃|在线)|"
+    r"半年(?:前|内)?(?:活跃|在线)|近半年(?:活跃|在线)|活跃于[^\n]*)"
 )
 
 
@@ -161,6 +172,8 @@ class Job:
     hr_name: str = ""
     hr_title: str = ""
     hr_active: str = ""
+    hr_kind: str = ""
+    hr_activity_bucket: str = ""
     # 以下字段来自点击卡片后列表页右侧的详情面板。
     skills: str = ""
     description: str = ""
@@ -258,6 +271,11 @@ def build_job(data: dict[str, object]) -> Job:
         for key, value in data.items()
         if key in JOB_FIELDS
     }
+    hr_text = " ".join(
+        str(values.get(field) or "") for field in ("hr_name", "hr_title", "hr_active")
+    )
+    values.setdefault("hr_kind", _hr_kind(hr_text))
+    values.setdefault("hr_activity_bucket", _hr_activity_bucket(hr_text))
     return Job(**values)
 
 
@@ -284,6 +302,10 @@ def job_from_history_record(record: dict[str, object]) -> Job:
         hr_name=str(hr.get("name") or ""),
         hr_title=str(hr.get("title") or ""),
         hr_active=str(hr.get("active") or ""),
+        hr_kind=str(hr.get("kind") or _hr_kind(str(hr.get("title") or ""))),
+        hr_activity_bucket=str(
+            hr.get("activity_bucket") or _hr_activity_bucket(str(hr.get("active") or ""))
+        ),
         skills=str(detail.get("skills") or ""),
         description=str(detail.get("description") or ""),
         benefits=str(detail.get("benefits") or ""),
@@ -364,6 +386,30 @@ def parse_keywords(text: str) -> tuple[str, ...]:
     return tuple(word.strip() for word in re.split(r"[,，]", text) if word.strip())
 
 
+def _hr_kind(text: str) -> str:
+    text = decode_boss_text(text).strip()
+    if not text:
+        return ""
+    if HR_HEADHUNTER_RE.search(text):
+        return "猎头"
+    if re.search(r"(招聘|hr|人事|招聘者|招聘专员|招聘经理|招聘负责人)", text, re.I):
+        return "招聘方"
+    return "未知"
+
+
+def _hr_activity_bucket(text: str) -> str:
+    text = decode_boss_text(text).strip()
+    if not text:
+        return ""
+    if HR_STALE_ACTIVITY_RE.search(text):
+        return "较久活跃"
+    if HR_RECENT_ACTIVITY_RE.search(text):
+        return "半年活跃" if ("半年" in text or "月内" in text) else "最近活跃"
+    if "活跃" in text and "前" not in text:
+        return "最近活跃"
+    return "未知"
+
+
 def _match_level(text: str, levels: dict[str, int]) -> int | None:
     """从岗位要求文案中读出档位，优先匹配更长的标签（如“1-3年”先于“1年”）。"""
     for label in sorted(levels, key=len, reverse=True):
@@ -434,6 +480,14 @@ def job_rejection_reason(job: Job, options: SearchOptions) -> str | None:
     )
 
 
+def hr_rejection_reason(job: Job) -> str | None:
+    if job.hr_kind == "猎头":
+        return f"HR 身份为猎头：{job.hr_title or job.hr_name or '空'}"
+    if job.hr_activity_bucket == "较久活跃":
+        return f"HR 活跃状态过旧：{job.hr_active or '空'}"
+    return None
+
+
 def job_matches(job: Job, options: SearchOptions) -> bool:
     return job_rejection_reason(job, options) is None
 
@@ -463,6 +517,8 @@ def append_contact_history(
             "name": job.hr_name,
             "title": job.hr_title,
             "active": job.hr_active,
+            "kind": job.hr_kind,
+            "activity_bucket": job.hr_activity_bucket,
         },
         "detail": {
             "status": job.detail_status,
@@ -485,6 +541,11 @@ def append_contact_history(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def record_skipped_job(job: Job, options: SearchOptions) -> None:
+    status = "跳过：猎头" if job.hr_kind == "猎头" else "跳过：HR 活跃过旧"
+    append_contact_history(replace(job, contact_status=status), options)
 
 
 class JobWorker(QThread):
@@ -566,23 +627,48 @@ class JobWorker(QThread):
                         f"[读取] 岗位={job.title!r} | 薪资原文={raw_display!r} | "
                         f"薪资解码={job.salary!r} | 地区={job.area!r} | "
                         f"经验={job.experience!r} | 学历={job.education!r} | "
-                        f"公司={job.company!r} | 标签={job.tags!r}"
+                        f"公司={job.company!r} | 标签={job.tags!r} | "
+                        f"HR身份={job.hr_kind or '未知'} | "
+                        f"HR活跃级别={job.hr_activity_bucket or '未知'}"
                     )
                     reason = job_rejection_reason(job, self.options)
                     if reason:
                         self.log_message.emit(f"[跳过] {job.title} | 原因={reason}")
+                        continue
+                    hr_reason = hr_rejection_reason(job)
+                    if hr_reason:
+                        self.log_message.emit(f"[跳过] {job.title} | 原因={hr_reason}")
+                        try:
+                            record_skipped_job(job, self.options)
+                        except OSError as exc:
+                            self.log_message.emit(f"[记录失败] {exc}")
                         continue
 
                     self.log_message.emit(f"[匹配] {job.title} | {job.salary}")
                     if self.options.fetch_detail:
                         self.status_changed.emit(f"匹配 {job.title}，正在读取岗位详情...")
                         job = replace(job, **self._read_detail(page, job))
+                        if not job.hr_kind:
+                            job = replace(job, hr_kind=_hr_kind(" ".join(
+                                part for part in (job.hr_name, job.hr_title, job.hr_active) if part
+                            )))
+                        if not job.hr_activity_bucket:
+                            job = replace(job, hr_activity_bucket=_hr_activity_bucket(job.hr_active))
+                        hr_reason = hr_rejection_reason(job)
+                        if hr_reason:
+                            self.log_message.emit(f"[跳过] {job.title} | 原因={hr_reason}")
+                            try:
+                                record_skipped_job(job, self.options)
+                            except OSError as exc:
+                                self.log_message.emit(f"[记录失败] {exc}")
+                            continue
                         self.log_message.emit(
                             f"[详情] {job.title} | 状态={job.detail_status} | "
                             f"技能={job.skills or '空'} | 福利={job.benefits or '空'} | "
                             f"地址={job.address or '空'} | "
                             f"HR={job.hr_name or '空'}（{job.hr_title or '未知'}，"
-                            f"{job.hr_active or '活跃度未知'}） | "
+                            f"{job.hr_active or '活跃度未知'}，{job.hr_kind or '身份未知'}，"
+                            f"{job.hr_activity_bucket or '活跃未知'}） | "
                             f"描述{len(job.description)} 字"
                         )
                     if self.options.auto_contact:
@@ -715,7 +801,7 @@ return {
     || sectionText('工作地址', ['点击查看地图', '查看更多信息']),
   hr_name: text('.boss-info-attr, .boss-name, [class*=\"boss-name\"]'),
   hr_text: hrText,
-  hr_active: (hrText.match(/(刚刚活跃|今日活跃|本周活跃|\d+(?:分钟|小时|天|周|月)内活跃|活跃于[^\n]*)/) || [''])[0]
+  hr_active: (hrText.match(/(刚刚(?:活跃|在线)|今日(?:活跃|在线)|本周(?:活跃|在线)|本月(?:活跃|在线)|最近(?:活跃|在线)|\d+(?:分钟|小时|天|周)内(?:活跃|在线)|\d+(?:个)?月(?:前|内)?(?:活跃|在线)|几个月前(?:活跃|在线)|半年(?:前|内)?(?:活跃|在线)|近半年(?:活跃|在线)|活跃于[^\n]*)/) || [''])[0]
 };
 """
 
@@ -847,6 +933,8 @@ class MainWindow(QMainWindow):
         ("HR", "hr_name"),
         ("HR 职位", "hr_title"),
         ("HR 活跃", "hr_active"),
+        ("HR 身份", "hr_kind"),
+        ("HR 活跃级别", "hr_activity_bucket"),
         ("技能要求", "skills"),
         ("福利", "benefits"),
         ("工作地址", "address"),
@@ -858,7 +946,17 @@ class MainWindow(QMainWindow):
     STATUS_COLUMN = HEADERS.index("沟通状态")
     DESCRIPTION_COLUMN = HEADERS.index("职位描述")
     # 默认隐藏的次要列：仍会采集并导出，可用“显示全部列”展开。
-    OPTIONAL_COLUMNS = ("规模", "融资阶段", "HR 职位", "HR 活跃", "福利", "工作地址", "标签")
+    OPTIONAL_COLUMNS = (
+        "规模",
+        "融资阶段",
+        "HR 职位",
+        "HR 活跃",
+        "HR 身份",
+        "HR 活跃级别",
+        "福利",
+        "工作地址",
+        "标签",
+    )
     # 沟通记录表格列：(标题, 从 JSONL 记录取值的函数)。
     HISTORY_COLUMNS: tuple[tuple[str, str], ...] = (
         ("时间", "recorded_at"),
@@ -867,6 +965,8 @@ class MainWindow(QMainWindow):
         ("地区", "area"),
         ("公司", "company"),
         ("HR", "hr"),
+        ("HR 身份", "hr_kind"),
+        ("HR 活跃级别", "hr_activity_bucket"),
         ("搜索词", "query"),
         ("状态", "status"),
         ("岗位链接", "link"),
@@ -1762,6 +1862,10 @@ class MainWindow(QMainWindow):
             return " · ".join(
                 str(hr.get(field) or "") for field in ("name", "title") if hr.get(field)
             )
+        if key in {"hr_kind", "hr_activity_bucket"}:
+            hr = record.get("hr")
+            hr = hr if isinstance(hr, dict) else {}
+            return str(hr.get(key) or "")
         if key == "query":
             search = record.get("search")
             search = search if isinstance(search, dict) else {}
