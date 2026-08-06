@@ -98,11 +98,13 @@ EDUCATION_LEVELS = {
     "博士": 6,
 }
 CARD_SELECTORS = ".job-card-wrapper, .job-card-box, li.job-card-wrapper"
+CONTACT_LIMIT_STATUS = "未沟通（今日沟通已达上限）"
 # 结果表“沟通状态”列的配色，未列出的状态按告警色显示。
 CONTACT_STATUS_COLORS = {
     "已发起沟通": "#0f7a58",
     "此前已沟通": "#5a6b7b",
     "未沟通": "#8b98a5",
+    CONTACT_LIMIT_STATUS: "#b91c1c",
     "跳过：猎头": "#9f1239",
     "跳过：HR 活跃过旧": "#b45309",
     "跳过：HR 活跃不符": "#b45309",
@@ -602,6 +604,7 @@ class JobWorker(QThread):
         super().__init__()
         self.options = options
         self._stop_requested = False
+        self._stop_reason = ""
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -723,6 +726,11 @@ class JobWorker(QThread):
                             self.log_message.emit(
                                 f"[沟通] {job.title} | 状态={job.contact_status}"
                             )
+                            if job.contact_status == CONTACT_LIMIT_STATUS:
+                                self._stop_requested = True
+                                self._stop_reason = CONTACT_LIMIT_STATUS
+                                self.status_changed.emit("已达到今日沟通上限，自动停止。")
+                                self.log_message.emit("[停止] 已达到今日沟通上限。")
                             if job.contact_status in {"已发起沟通", "此前已沟通"}:
                                 try:
                                     append_contact_history(job, self.options)
@@ -736,6 +744,8 @@ class JobWorker(QThread):
                         if job.contact_status in {"已发起沟通", "此前已沟通"}:
                             contacted += 1
                         self.stats_changed.emit(len(seen), matched, contacted)
+                        if self._stop_requested:
+                            break
                         if matched >= self.options.max_results:
                             break
                         if self.options.auto_contact and job.contact_status == "已发起沟通":
@@ -934,6 +944,22 @@ return true;
             time.sleep(0.5)
 
     @staticmethod
+    def _close_contact_tip(page: object) -> str:
+        try:
+            return str(page.run_js(r"""
+const text = (document.body?.innerText || '').trim();
+if (!/(温馨提示|您已达到沟通上限|达到沟通上限|沟通机会|明天再来)/.test(text)) return '';
+const visible = node => node.offsetParent !== null || node.getClientRects().length > 0;
+const button = Array.from(document.querySelectorAll('button,a,[class*="btn"],[class*="button"],span,div'))
+  .filter(visible)
+  .find(node => /^(好|确定|知道了)$/.test((node.innerText || '').trim()));
+if (button) button.click();
+return text;
+""") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
     def _contact(page: object, job: Job) -> str:
         selected = page.run_js(
             r"""
@@ -962,15 +988,21 @@ return true;
             return f"未沟通（{label or '按钮不可用'}）"
 
         button.click()
-        stay_button = page.ele("css:.greet-boss-container .cancel-btn", timeout=8)
-        if not stay_button:
-            return "未完成（未出现沟通结果弹窗）"
-        stay_label = stay_button.text.strip()
-        if "留在此页" not in stay_label:
-            return f"未完成（弹窗按钮为 {stay_label or '空'}）"
-        stay_button.click()
-        time.sleep(1)
-        return "已发起沟通"
+        for _ in range(8):
+            tip = JobWorker._close_contact_tip(page)
+            if tip:
+                if re.search(r"达到.*上限|已达上限|次数不足|机会不足|用完", tip):
+                    return CONTACT_LIMIT_STATUS
+                return "已发起沟通"
+            stay_button = page.ele("css:.greet-boss-container .cancel-btn", timeout=1)
+            if stay_button:
+                stay_label = stay_button.text.strip()
+                if "留在此页" not in stay_label:
+                    return f"未完成（弹窗按钮为 {stay_label or '空'}）"
+                stay_button.click()
+                time.sleep(1)
+                return "已发起沟通"
+        return "未完成（未出现沟通结果弹窗）"
 
 
 class LoginWorker(QThread):
@@ -1720,6 +1752,14 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def search_completed(self, count: int) -> None:
+        if self.worker and self.worker._stop_reason == CONTACT_LIMIT_STATUS:
+            self._set_status("已达到今日沟通上限，自动停止。", "error")
+            QMessageBox.information(
+                self,
+                "已停止采集",
+                "已达到今日沟通上限，BossPilot 已自动停止采集。",
+            )
+            return
         self._set_status(f"采集完成，共匹配 {count} 个岗位。", "success")
 
     @Slot(str)

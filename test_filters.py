@@ -10,6 +10,7 @@ from main import (
     SearchOptions,
     append_contact_history,
     boss_browser_options,
+    CONTACT_LIMIT_STATUS,
     decode_boss_text,
     job_from_history_record,
     job_matches,
@@ -184,13 +185,22 @@ def test_contact_actions() -> None:
 
     class Page:
         def __init__(
-            self, selected: bool, button: Button, stay_button: Button | None = None
+            self,
+            selected: bool,
+            button: Button,
+            stay_button: Button | None = None,
+            tip: str = "",
         ) -> None:
             self.selected = selected
             self.button = button
             self.stay_button = stay_button
+            self.tip = tip
 
-        def run_js(self, *_args: object) -> bool:
+        def run_js(self, _script: str, *args: object) -> object:
+            if not args:
+                tip = self.tip
+                self.tip = ""
+                return tip
             return self.selected
 
         def ele(self, selector: str, **_kwargs: object) -> Button | None:
@@ -205,6 +215,24 @@ def test_contact_actions() -> None:
     assert JobWorker._contact(Page(True, new_button, stay_button), job) == "已发起沟通"
     assert new_button.clicked
     assert stay_button.clicked
+    tip_button = Button("立即沟通")
+    assert (
+        JobWorker._contact(
+            Page(True, tip_button, tip="温馨提示\n您今天已与120位BOSS沟通，还剩30次沟通机会哦\n好"),
+            job,
+        )
+        == "已发起沟通"
+    )
+    assert tip_button.clicked
+    limit_button = Button("立即沟通")
+    assert (
+        JobWorker._contact(
+            Page(True, limit_button, tip="您已达到沟通上限\n您今天已与150位BOSS沟通，休息一下，明天再来吧~\n确定"),
+            job,
+        )
+        == CONTACT_LIMIT_STATUS
+    )
+    assert limit_button.clicked
     no_stay_button = Button("立即沟通")
     assert JobWorker._contact(Page(True, no_stay_button), job) == "未完成（未出现沟通结果弹窗）"
     assert no_stay_button.clicked
