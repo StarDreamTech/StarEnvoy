@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -106,6 +107,7 @@ CONTACT_STATUS_COLORS = {
     "未沟通": "#8b98a5",
     CONTACT_LIMIT_STATUS: "#b91c1c",
     "跳过：猎头": "#9f1239",
+    "跳过：岗位要求命中": "#b45309",
     "跳过：HR 活跃过旧": "#b45309",
     "跳过：HR 活跃不符": "#b45309",
 }
@@ -160,6 +162,9 @@ class SearchOptions:
     fetch_detail: bool = True
     skip_headhunters: bool = True
     hr_activity_mode: str = "仅最近活跃"
+    requirement_block_keywords: tuple[str, ...] = ()
+    salary_max_enabled: bool = False
+    salary_max: int = 0
 
 
 @dataclass(frozen=True)
@@ -395,6 +400,10 @@ def parse_keywords(text: str) -> tuple[str, ...]:
     return tuple(word.strip() for word in re.split(r"[,，]", text) if word.strip())
 
 
+def parse_line_keywords(text: str) -> tuple[str, ...]:
+    return tuple(line.strip() for line in text.splitlines() if line.strip())
+
+
 def search_queries(options: SearchOptions) -> tuple[str, ...]:
     queries = []
     seen = set()
@@ -495,6 +504,8 @@ def job_rejection_reason(job: Job, options: SearchOptions) -> str | None:
             return f"最低薪资 {low:g}K 低于 {options.salary_k}K"
         if options.salary_mode == "薪资范围包含" and not low <= options.salary_k <= high:
             return f"{options.salary_k}K 不在 {low:g}-{high:g}K 范围内"
+        if options.salary_max_enabled and options.salary_max and high >= options.salary_max:
+            return f"最高薪资 {high:g}K 命中上限 {options.salary_max}K"
 
     return _multi_level_rejection_reason(
         "经验", job.experience, options.experiences, EXPERIENCE_LEVELS
@@ -513,6 +524,15 @@ def hr_rejection_reason(job: Job, options: SearchOptions) -> str | None:
         return f"HR 活跃状态不够新：{job.hr_active or '空'}"
     if options.hr_activity_mode == "跳过较久活跃" and job.hr_activity_bucket == "较久活跃":
         return f"HR 活跃状态过旧：{job.hr_active or '空'}"
+    return None
+
+
+def detail_rejection_reason(job: Job, options: SearchOptions) -> str | None:
+    text = "\n".join((job.description, job.skills, job.benefits)).casefold()
+    for keyword in options.requirement_block_keywords:
+        keyword = keyword.strip()
+        if keyword and keyword.casefold() in text:
+            return f"岗位要求命中跳过词：{keyword}"
     return None
 
 
@@ -576,10 +596,13 @@ def append_contact_history(
             "keyword_mode": options.keyword_mode,
             "salary_k": options.salary_k,
             "salary_mode": options.salary_mode,
+            "salary_max_enabled": options.salary_max_enabled,
+            "salary_max": options.salary_max,
             "experiences": list(options.experiences),
             "educations": list(options.educations),
             "skip_headhunters": options.skip_headhunters,
             "hr_activity_mode": options.hr_activity_mode,
+            "requirement_block_keywords": list(options.requirement_block_keywords),
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -587,9 +610,19 @@ def append_contact_history(
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def record_skipped_job(job: Job, options: SearchOptions, reason: str) -> None:
-    status = "跳过：猎头" if "猎头" in reason else "跳过：HR 活跃不符"
-    append_contact_history(replace(job, contact_status=status), options)
+def record_skipped_job(
+    job: Job,
+    options: SearchOptions,
+    reason: str,
+    path: Path = CONTACT_HISTORY_PATH,
+) -> None:
+    if "猎头" in reason:
+        status = "跳过：猎头"
+    elif "岗位要求" in reason:
+        status = "跳过：岗位要求命中"
+    else:
+        status = "跳过：HR 活跃不符"
+    append_contact_history(replace(job, contact_status=status), options, path)
 
 
 class JobWorker(QThread):
@@ -618,11 +651,14 @@ class JobWorker(QThread):
             matched = 0
             contacted = 0
             queries = search_queries(self.options)
+            salary_label = f"{self.options.salary_k}K"
+            if self.options.salary_max_enabled and self.options.salary_max:
+                salary_label += f"~<{self.options.salary_max}K"
             self.log_message.emit(
                 "[筛选条件] "
                 f"地区={self.options.city} | 搜索词={self.options.query!r} | "
                 f"关键词={', '.join(self.options.title_keywords) or '无'} | "
-                f"模式={self.options.keyword_mode} | 薪资={self.options.salary_mode} {self.options.salary_k}K | "
+                f"模式={self.options.keyword_mode} | 薪资={self.options.salary_mode} {salary_label} | "
                 f"经验={'、'.join(self.options.experiences) or '不限'} | "
                 f"学历={'、'.join(self.options.educations) or '不限'} | "
                 f"跳过猎头={'是' if self.options.skip_headhunters else '否'} | "
@@ -718,6 +754,14 @@ class JobWorker(QThread):
                                 f"{job.hr_activity_bucket or '活跃未知'}） | "
                                 f"描述{len(job.description)} 字"
                             )
+                            detail_reason = detail_rejection_reason(job, self.options)
+                            if detail_reason:
+                                self.log_message.emit(f"[跳过] {job.title} | 原因={detail_reason}")
+                                try:
+                                    record_skipped_job(job, self.options, detail_reason)
+                                except OSError as exc:
+                                    self.log_message.emit(f"[记录失败] {exc}")
+                                continue
                         if self.options.auto_contact:
                             self.status_changed.emit(
                                 f"匹配 {job.title}，正在发起沟通..."
@@ -950,10 +994,21 @@ return true;
 const text = (document.body?.innerText || '').trim();
 if (!/(温馨提示|您已达到沟通上限|达到沟通上限|沟通机会|明天再来)/.test(text)) return '';
 const visible = node => node.offsetParent !== null || node.getClientRects().length > 0;
-const button = Array.from(document.querySelectorAll('button,a,[class*="btn"],[class*="button"],span,div'))
+const clickNode = node => {
+  const target = node.closest('button,a,[role="button"],[class*="btn"],[class*="button"]') || node;
+  target.scrollIntoView?.({block: 'center', inline: 'center'});
+  for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+    target.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+  }
+  target.click?.();
+};
+const dialog = document.querySelector('.chat-block-dialog');
+const button = dialog?.querySelector('.sure-btn,.default-btn')
+  || Array.from(document.querySelectorAll('button,a,[role="button"],[class*="btn"],[class*="button"],span,div'))
   .filter(visible)
-  .find(node => /^(好|确定|知道了)$/.test((node.innerText || '').trim()));
-if (button) button.click();
+  .find(node => /^(好|确定|知道了)$/.test((node.innerText || '').trim().replace(/\s+/g, '')));
+if (!button) return '';
+clickNode(button);
 return text;
 """) or "")
         except Exception:
@@ -989,6 +1044,7 @@ return true;
 
         button.click()
         for _ in range(8):
+            time.sleep(0.3)
             tip = JobWorker._close_contact_tip(page)
             if tip:
                 if re.search(r"达到.*上限|已达上限|次数不足|机会不足|用完", tip):
@@ -1084,6 +1140,7 @@ class MainWindow(QMainWindow):
         ("salary", "薪资"),
         ("experience", "经验"),
         ("education", "学历"),
+        ("requirement_block", "要求避开"),
         ("headhunter", "猎头"),
         ("hr_active", "HR 活跃"),
         ("detail", "详情"),
@@ -1118,7 +1175,11 @@ class MainWindow(QMainWindow):
 
         self.login_button.clicked.connect(self.open_login)
         self.salary_mode.currentTextChanged.connect(self._sync_salary_enabled)
+        self.salary_max_enabled.toggled.connect(self._sync_salary_max_enabled)
+        self.salary_max_enabled.toggled.connect(self._refresh_filter_chips)
+        self.salary_max.valueChanged.connect(self._refresh_filter_chips)
         self._sync_salary_enabled(self.salary_mode.currentText())
+        self._sync_salary_max_enabled(self.salary_max_enabled.isChecked())
         for control in self.filter_controls:
             signal = (
                 getattr(control, "selection_changed", None)
@@ -1127,7 +1188,8 @@ class MainWindow(QMainWindow):
                 or getattr(control, "valueChanged", None)
                 or getattr(control, "toggled", None)
             )
-            signal.connect(self._refresh_filter_chips)
+            if signal is not None:
+                signal.connect(self._refresh_filter_chips)
         self._refresh_filter_chips()
         self.start_button.clicked.connect(self.start_search)
         self.stop_button.clicked.connect(self.stop_search)
@@ -1237,12 +1299,33 @@ class MainWindow(QMainWindow):
         self.query.setPlaceholderText("用于 BOSS 搜索，例如 Python")
         self.keywords = QLineEdit("全栈, Python, Python后端")
         self.keywords.setPlaceholderText("逗号分隔，仅匹配岗位名称")
+        self.requirement_block_keywords = QTextEdit()
+        self.requirement_block_keywords.setAcceptRichText(False)
+        self.requirement_block_keywords.setMinimumHeight(112)
+        self.requirement_block_keywords.setPlaceholderText(
+            "每行一个，命中职位描述则跳过"
+        )
+        self.requirement_block_keywords.setToolTip(
+            "读取职位描述后，若岗位要求包含任一行内容则跳过沟通，并写入沟通记录；英文大小写不敏感。"
+        )
         self.keyword_mode = QComboBox()
         self.keyword_mode.addItems(["包含任一关键词", "包含全部关键词"])
         self.salary = QSpinBox()
         self.salary.setRange(1, 200)
         self.salary.setValue(12)
         self.salary.setSuffix(" K/月")
+        self.salary_max_enabled = QCheckBox("启用上限")
+        self.salary_max = QSpinBox()
+        self.salary_max.setRange(1, 200)
+        self.salary_max.setValue(20)
+        self.salary_max.setSuffix(" K/月")
+        self.salary_max.setToolTip("填写后，达到或超过这个值的岗位会排除")
+        self.salary_max_widget = QWidget()
+        salary_max_layout = QHBoxLayout(self.salary_max_widget)
+        salary_max_layout.setContentsMargins(0, 0, 0, 0)
+        salary_max_layout.setSpacing(8)
+        salary_max_layout.addWidget(self.salary_max_enabled)
+        salary_max_layout.addWidget(self.salary_max, 1)
         self.salary_mode = QComboBox()
         self.salary_mode.addItems(SALARY_MODES)
         self.experience = MultiSelectComboBox(EXPERIENCES, ("1-3年",))
@@ -1289,10 +1372,12 @@ class MainWindow(QMainWindow):
             (
                 "岗位条件",
                 [
-                    ("目标月薪", self.salary),
+                    ("最低月薪", self.salary),
+                    ("最高月薪", self.salary_max_widget),
                     ("薪资规则", self.salary_mode),
                     ("我的工作经验", self.experience),
                     ("我的学历", self.education),
+                    ("要求跳过词", self.requirement_block_keywords),
                 ],
             ),
             (
@@ -1662,6 +1747,8 @@ class MainWindow(QMainWindow):
             keyword_mode=self.keyword_mode.currentText(),
             salary_k=self.salary.value(),
             salary_mode=self.salary_mode.currentText(),
+            salary_max_enabled=self.salary_max_enabled.isChecked(),
+            salary_max=self.salary_max.value() if self.salary_max_enabled.isChecked() else 0,
             experiences=self.experience.checked_texts(),
             educations=self.education.checked_texts(),
             max_results=self.max_results.value(),
@@ -1671,6 +1758,9 @@ class MainWindow(QMainWindow):
             fetch_detail=self.fetch_detail.isChecked(),
             skip_headhunters=self.skip_headhunters.isChecked(),
             hr_activity_mode=self.hr_activity_mode.currentText(),
+            requirement_block_keywords=parse_line_keywords(
+                self.requirement_block_keywords.toPlainText()
+            ),
         )
         self.clear_results()
         self.tabs.setCurrentIndex(self.TAB_RESULTS)
@@ -1825,6 +1915,15 @@ class MainWindow(QMainWindow):
     def _sync_salary_enabled(self, mode: str) -> None:
         """薪资规则选择“不限”时，目标月薪输入没有意义。"""
         self.salary.setEnabled(mode != "不限" and self.start_button.isEnabled())
+        self.salary_max_enabled.setEnabled(mode != "不限" and self.start_button.isEnabled())
+        self._sync_salary_max_enabled(self.salary_max_enabled.isChecked())
+
+    @Slot(bool)
+    def _sync_salary_max_enabled(self, enabled: bool) -> None:
+        """只有勾选上限后，最高月薪输入才可编辑。"""
+        self.salary_max.setEnabled(
+            enabled and self.start_button.isEnabled() and self.salary_mode.currentText() != "不限"
+        )
 
     @staticmethod
     def _save_column_visibility(
@@ -1871,9 +1970,25 @@ class MainWindow(QMainWindow):
     def _filter_chip_values(self) -> dict[str, tuple[str, str]]:
         """每个条件胶囊的 (显示文本, 悬停说明)。"""
         keywords = parse_keywords(self.keywords.text())
+        block_keywords = parse_line_keywords(
+            self.requirement_block_keywords.toPlainText()
+        )
         query = self.query.text().strip()
         salary_mode = self.salary_mode.currentText()
-        prefix = {"最低薪资不低于": "≥", "薪资范围包含": "含 "}.get(salary_mode, "")
+        salary_display = "不限" if salary_mode == "不限" else f"≥{self.salary.value()}K"
+        if self.salary_max_enabled.isChecked():
+            salary_display = f"{salary_display} / <{self.salary_max.value()}K"
+        salary_tooltip = "；".join(
+            part
+            for part in (
+                f"薪资规则：{salary_mode}",
+                f"下限：{self.salary.value()}K" if salary_mode != "不限" else "",
+                f"上限：{self.salary_max.value()}K（命中则排除）"
+                if self.salary_max_enabled.isChecked()
+                else "",
+            )
+            if part
+        )
         return {
             "city": (self.city.currentText(), "搜索城市"),
             "query": (query or "未填写", f"BOSS 搜索词：{query or '未填写'}"),
@@ -1883,10 +1998,7 @@ class MainWindow(QMainWindow):
                     "、".join(keywords) if keywords else "未填写，不做关键词过滤"
                 ),
             ),
-            "salary": (
-                "不限" if salary_mode == "不限" else f"{prefix}{self.salary.value()}K",
-                f"薪资规则：{salary_mode}",
-            ),
+            "salary": (salary_display, salary_tooltip),
             "experience": (
                 "、".join(self.experience.checked_texts()) or "不限",
                 "我的工作经验；岗位要求满足任一所选档位即视为匹配",
@@ -1894,6 +2006,12 @@ class MainWindow(QMainWindow):
             "education": (
                 "、".join(self.education.checked_texts()) or "不限",
                 "我的学历；岗位要求满足任一所选档位即视为匹配",
+            ),
+            "requirement_block": (
+                f"{len(block_keywords)} 个" if block_keywords else "不限",
+                "岗位要求命中则跳过沟通：" + (
+                    "、".join(block_keywords) if block_keywords else "未填写"
+                ),
             ),
             "headhunter": (
                 "跳过" if self.skip_headhunters.isChecked() else "不限",
@@ -2052,7 +2170,24 @@ class MainWindow(QMainWindow):
         self.keywords.setText(
             settings.value("filters/keywords", self.keywords.text(), type=str)
         )
+        self.requirement_block_keywords.setPlainText(
+            settings.value(
+                "filters/requirement_block_keywords",
+                self.requirement_block_keywords.toPlainText(),
+                type=str,
+            )
+        )
         self.salary.setValue(settings.value("filters/salary", self.salary.value(), type=int))
+        stored_salary_max = settings.value("filters/salary_max", None, type=int)
+        if stored_salary_max and int(stored_salary_max) > 0:
+            self.salary_max.setValue(int(stored_salary_max))
+        self.salary_max_enabled.setChecked(
+            settings.value(
+                "filters/salary_max_enabled",
+                bool(stored_salary_max and int(stored_salary_max) > 0),
+                type=bool,
+            )
+        )
         self.max_results.setValue(
             settings.value("filters/max_results", self.max_results.value(), type=int)
         )
@@ -2087,9 +2222,12 @@ class MainWindow(QMainWindow):
             "city": self.city.currentText(),
             "query": self.query.text(),
             "keywords": self.keywords.text(),
+            "requirement_block_keywords": self.requirement_block_keywords.toPlainText(),
             "keyword_mode": self.keyword_mode.currentText(),
             "salary": self.salary.value(),
             "salary_mode": self.salary_mode.currentText(),
+            "salary_max_enabled": self.salary_max_enabled.isChecked(),
+            "salary_max": self.salary_max.value(),
             "experiences": list(self.experience.checked_texts()),
             "educations": list(self.education.checked_texts()),
             "max_results": self.max_results.value(),
@@ -2209,13 +2347,14 @@ QFrame#vDivider { border: none; border-left: 1px solid #eef2f6;
                   max-width: 1px; margin: 4px 0; }
 QFrame#hDivider { border: none; border-top: 1px solid #eef2f6; max-height: 1px; }
 
-QLineEdit, QComboBox, QSpinBox {
+QLineEdit, QTextEdit, QComboBox, QSpinBox {
     min-height: 31px; padding: 0 10px; border: 1px solid #d6dee8;
     border-radius: 8px; background: #ffffff; selection-background-color: #b8e2e7;
     selection-color: #0f1b26; }
-QLineEdit:hover, QComboBox:hover, QSpinBox:hover { border-color: #b6c4d2; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #0d7d8c; }
-QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
+QTextEdit { padding: 8px 10px; }
+QLineEdit:hover, QTextEdit:hover, QComboBox:hover, QSpinBox:hover { border-color: #b6c4d2; }
+QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #0d7d8c; }
+QLineEdit:disabled, QTextEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
     background: #f1f4f8; color: #9aa7b4; border-color: #e2e8f0; }
 QComboBox::drop-down { width: 22px; border: none; }
 QComboBox QAbstractItemView { border: 1px solid #d6dee8; border-radius: 8px;

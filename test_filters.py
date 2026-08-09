@@ -12,11 +12,13 @@ from main import (
     boss_browser_options,
     CONTACT_LIMIT_STATUS,
     decode_boss_text,
+    detail_rejection_reason,
     job_from_history_record,
     job_matches,
     hr_rejection_reason,
     refresh_hr_status,
     parse_keywords,
+    parse_line_keywords,
     parse_monthly_salary,
     search_queries,
 )
@@ -31,6 +33,8 @@ def options(**changes: object) -> SearchOptions:
         "keyword_mode": "包含任一关键词",
         "salary_k": 12,
         "salary_mode": "最低薪资不低于",
+        "salary_max_enabled": False,
+        "salary_max": 0,
         "experiences": ("3-5年",),
         "educations": ("本科",),
         "max_results": 100,
@@ -70,6 +74,14 @@ def test_keyword_parser() -> None:
     )
 
 
+def test_line_keyword_parser() -> None:
+    assert parse_line_keywords("springboot\n spring boot \n\nOpenAI") == (
+        "springboot",
+        "spring boot",
+        "OpenAI",
+    )
+
+
 def test_search_queries_include_title_keywords_once() -> None:
     assert search_queries(
         options(query=" Python ", title_keywords=("python", "全栈", "Python后端"))
@@ -83,6 +95,20 @@ def test_job_filters() -> None:
     assert job_matches(job, options(salary_k=15, salary_mode="薪资范围包含"))
     assert job_matches(job, options(title_keywords=("PYTHON后端",)))
     assert job_matches(job, options(title_keywords=("python后端",)))
+
+
+def test_salary_upper_bound_excludes_hits() -> None:
+    job = Job("Python后端开发", "12-20K·13薪", "杭州·西湖区", "3-5年", "本科", "示例科技", "Python", "https://example.com")
+    assert not job_matches(job, options(salary_max_enabled=True, salary_max=20))
+    assert job_matches(
+        Job("Python后端开发", "12-19K·13薪", "杭州·西湖区", "3-5年", "本科", "示例科技", "Python", "https://example.com"),
+        options(salary_max_enabled=True, salary_max=20),
+    )
+
+
+def test_salary_upper_bound_can_be_disabled() -> None:
+    job = Job("Python后端开发", "12-20K·13薪", "杭州·西湖区", "3-5年", "本科", "示例科技", "Python", "https://example.com")
+    assert job_matches(job, options(salary_max_enabled=False, salary_max=20))
 
 
 def test_hr_filters_skip_headhunters_and_stale_activity() -> None:
@@ -112,6 +138,27 @@ def test_hr_filters_are_configurable() -> None:
     assert hr_rejection_reason(half_year, options(hr_activity_mode="跳过较久活跃")) is None
     assert hr_rejection_reason(stale, options(hr_activity_mode="跳过较久活跃")) == "HR 活跃状态过旧：半年前活跃"
     assert hr_rejection_reason(stale, options(hr_activity_mode="不限")) is None
+
+
+def test_detail_requirement_block_keywords_are_case_insensitive() -> None:
+    job = Job(
+        "Python后端",
+        description="负责 OpenAI API 接入，参与 OnCall 支持。",
+    )
+    assert (
+        detail_rejection_reason(
+            job,
+            options(requirement_block_keywords=("openai",)),
+        )
+        == "岗位要求命中跳过词：openai"
+    )
+    assert (
+        detail_rejection_reason(
+            job,
+            options(requirement_block_keywords=("区块链",)),
+        )
+        is None
+    )
 
 
 def test_detail_hr_activity_recomputes_unknown_bucket() -> None:
@@ -405,6 +452,32 @@ def test_contact_history() -> None:
         assert records[1]["contacted_at"] is None
         assert records[0]["title"] == "Python后端"
         assert records[0]["search"]["title_keywords"] == ["全栈", "Python后端"]
+
+
+def test_skipped_requirement_history_keeps_detail_and_keywords() -> None:
+    job = Job(
+        "Python后端",
+        "12-20K",
+        "杭州",
+        "3-5年",
+        "本科",
+        "示例科技",
+        "Python",
+        "https://example.com/job",
+        description="需要熟悉 OpenAI API。",
+    )
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "history.jsonl"
+        main.record_skipped_job(
+            job,
+            options(requirement_block_keywords=("openai",)),
+            "岗位要求命中跳过词：openai",
+            path,
+        )
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["status"] == "跳过：岗位要求命中"
+        assert record["detail"]["description"] == "需要熟悉 OpenAI API。"
+        assert record["search"]["requirement_block_keywords"] == ["openai"]
 
 
 def test_main_window_initializes() -> None:
