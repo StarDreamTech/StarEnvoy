@@ -1153,6 +1153,7 @@ class MainWindow(QMainWindow):
         self.login_worker: LoginWorker | None = None
         self.jobs: list[Job] = []
         self.history_records: list[dict[str, object]] = []
+        self._history_file_signature: tuple[int, int] | None = None
         self.setWindowTitle("BossPilot 岗位筛选")
         self.setMinimumSize(980, 700)
         self.resize(1180, 790)
@@ -1197,6 +1198,7 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(self.clear_results)
         self.table.cellDoubleClicked.connect(self.open_job)
         self.history_table.cellDoubleClicked.connect(self.show_history_detail)
+        self.history_table.cellClicked.connect(self.open_history_link)
         self.tabs.currentChanged.connect(self._tab_changed)
 
     def _build_header(self) -> QHBoxLayout:
@@ -1683,7 +1685,7 @@ class MainWindow(QMainWindow):
         )
         refresh = QPushButton("刷新")
         refresh.setObjectName("mini")
-        refresh.clicked.connect(self.load_history)
+        refresh.clicked.connect(lambda: self.load_history(force=True))
         open_file = QPushButton("打开文件")
         open_file.setObjectName("mini")
         open_file.setToolTip(str(CONTACT_HISTORY_PATH))
@@ -2043,14 +2045,21 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _tab_changed(self, index: int) -> None:
-        # 沟通记录在采集过程中会不断追加，每次切过来都重新读一遍文件。
         if index == self.TAB_HISTORY:
             self.load_history()
         self.edit_filters_button.setVisible(index != self.TAB_FILTERS)
 
-    @Slot()
-    def load_history(self) -> None:
+    @Slot(bool)
+    def load_history(self, force: bool = False) -> None:
         """读取沟通历史 JSONL；文件缺失或某一行损坏都不影响其余记录。"""
+        try:
+            file_stat = CONTACT_HISTORY_PATH.stat()
+            signature = (file_stat.st_mtime_ns, file_stat.st_size)
+        except OSError:
+            signature = None
+        if not force and signature == self._history_file_signature:
+            return
+
         records: list[dict[str, object]] = []
         try:
             text = CONTACT_HISTORY_PATH.read_text(encoding="utf-8")
@@ -2069,25 +2078,21 @@ class MainWindow(QMainWindow):
                 records.append(record)
         records.reverse()  # 最近的沟通排在最前
 
-        self.history_table.setRowCount(0)
+        self.history_table.setUpdatesEnabled(False)
+        self.history_table.setSortingEnabled(False)
+        self.history_table.clearContents()
+        self.history_table.setRowCount(len(records))
         self.history_records = records
-        for record in records:
-            row = self.history_table.rowCount()
-            self.history_table.insertRow(row)
+        for row, record in enumerate(records):
             for column, (_, key) in enumerate(self.HISTORY_COLUMNS):
                 item = QTableWidgetItem(self._history_cell(record, key))
                 item.setToolTip(item.text())
                 if key == "open":
-                    button = QToolButton()
-                    button.setText("打开")
-                    button.setObjectName("mini")
-                    button.setToolTip(str(record.get("link") or "无岗位链接"))
-                    button.setEnabled(bool(record.get("link")))
-                    button.clicked.connect(
-                        lambda _checked=False, link=str(record.get("link") or ""): self.open_link(link)
-                    )
-                    self.history_table.setCellWidget(row, column, button)
-                    continue
+                    link = str(record.get("link") or "")
+                    item.setText("打开" if link else "")
+                    item.setToolTip(link or "无岗位链接")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setData(Qt.ItemDataRole.UserRole, link)
                 if column == 0:
                     item.setData(
                         Qt.ItemDataRole.UserRole, str(record.get("link") or "")
@@ -2097,6 +2102,8 @@ class MainWindow(QMainWindow):
                         QColor(CONTACT_STATUS_COLORS.get(item.text(), "#b45309"))
                     )
                 self.history_table.setItem(row, column, item)
+        self.history_table.setUpdatesEnabled(True)
+        self._history_file_signature = signature
         self.history_count.setText(f"{len(records)} 条记录")
         self.history_stack.setCurrentIndex(1 if records else 0)
         self.tabs.setTabText(
@@ -2132,6 +2139,14 @@ class MainWindow(QMainWindow):
     def open_link(self, link: str) -> None:
         if link:
             QDesktopServices.openUrl(QUrl(link))
+
+    @Slot(int, int)
+    def open_history_link(self, row: int, column: int) -> None:
+        if column != self.HISTORY_OPEN_COLUMN:
+            return
+        item = self.history_table.item(row, column)
+        link = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        self.open_link(str(link or ""))
 
     @staticmethod
     def _settings_texts(value: object) -> tuple[str, ...]:
