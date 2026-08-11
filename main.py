@@ -397,7 +397,9 @@ def boss_browser_options(
 
 
 def parse_keywords(text: str) -> tuple[str, ...]:
-    return tuple(word.strip() for word in re.split(r"[,，]", text) if word.strip())
+    return tuple(
+        word.strip() for word in re.split(r"[,，\n]+", text) if word.strip()
+    )
 
 
 def parse_line_keywords(text: str) -> tuple[str, ...]:
@@ -1299,8 +1301,11 @@ class MainWindow(QMainWindow):
         self.city.setCurrentText("杭州")
         self.query = QLineEdit("Python")
         self.query.setPlaceholderText("用于 BOSS 搜索，例如 Python")
-        self.keywords = QLineEdit("全栈, Python, Python后端")
-        self.keywords.setPlaceholderText("逗号分隔，仅匹配岗位名称")
+        self.keywords = QTextEdit()
+        self.keywords.setAcceptRichText(False)
+        self.keywords.setMinimumHeight(112)
+        self.keywords.setPlainText("全栈\nPython\nPython后端")
+        self.keywords.setPlaceholderText("每行一个，也可逗号分隔，仅匹配岗位名称")
         self.requirement_block_keywords = QTextEdit()
         self.requirement_block_keywords.setAcceptRichText(False)
         self.requirement_block_keywords.setMinimumHeight(112)
@@ -1739,7 +1744,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少搜索词", "请输入 BOSS 搜索词。")
             return
         self._save_settings()
-        keywords = parse_keywords(self.keywords.text())
+        keywords = parse_keywords(self.keywords.toPlainText())
         city = self.city.currentText()
         options = SearchOptions(
             city=city,
@@ -1971,7 +1976,7 @@ class MainWindow(QMainWindow):
 
     def _filter_chip_values(self) -> dict[str, tuple[str, str]]:
         """每个条件胶囊的 (显示文本, 悬停说明)。"""
-        keywords = parse_keywords(self.keywords.text())
+        keywords = parse_keywords(self.keywords.toPlainText())
         block_keywords = parse_line_keywords(
             self.requirement_block_keywords.toPlainText()
         )
@@ -2182,8 +2187,8 @@ class MainWindow(QMainWindow):
         )
 
         self.query.setText(settings.value("filters/query", self.query.text(), type=str))
-        self.keywords.setText(
-            settings.value("filters/keywords", self.keywords.text(), type=str)
+        self.keywords.setPlainText(
+            settings.value("filters/keywords", self.keywords.toPlainText(), type=str)
         )
         self.requirement_block_keywords.setPlainText(
             settings.value(
@@ -2236,7 +2241,7 @@ class MainWindow(QMainWindow):
         values = {
             "city": self.city.currentText(),
             "query": self.query.text(),
-            "keywords": self.keywords.text(),
+            "keywords": self.keywords.toPlainText(),
             "requirement_block_keywords": self.requirement_block_keywords.toPlainText(),
             "keyword_mode": self.keyword_mode.currentText(),
             "salary": self.salary.value(),
