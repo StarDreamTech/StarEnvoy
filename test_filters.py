@@ -483,5 +483,52 @@ def test_skipped_requirement_history_keeps_detail_and_keywords() -> None:
 def test_main_window_initializes() -> None:
     app = QApplication.instance() or QApplication([])
     window = main.MainWindow()
+    assert window.windowTitle() == "星使 / StarEnvoy 岗位筛选"
     assert window.table.columnCount() == len(window.HEADERS)
     window.close()
+
+
+def test_legacy_settings_are_copied_once_without_deleting_old_values() -> None:
+    from PySide6.QtCore import QSettings
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        legacy = QSettings(str(root / "legacy.ini"), QSettings.Format.IniFormat)
+        legacy.setValue("filters/query", "Python")
+        legacy.setValue("filters/salary", 18)
+        legacy.setValue("filters/auto_contact", True)
+        legacy.setValue("columns/result", ["规模", "福利"])
+        legacy.sync()
+
+        current = QSettings(str(root / "current.ini"), QSettings.Format.IniFormat)
+        assert main.migrate_legacy_settings(current, legacy) is True
+
+        reloaded = QSettings(str(root / "current.ini"), QSettings.Format.IniFormat)
+        assert reloaded.value("filters/query") == "Python"
+        assert int(reloaded.value("filters/salary")) == 18
+        assert reloaded.value("filters/auto_contact", type=bool) is True
+        hidden = reloaded.value("columns/result")
+        texts = hidden if isinstance(hidden, list) else main.MainWindow._settings_texts(hidden)
+        assert "规模" in texts
+        assert "福利" in texts
+
+        kept = QSettings(str(root / "legacy.ini"), QSettings.Format.IniFormat)
+        assert kept.value("filters/query") == "Python"
+        assert "filters/salary" in kept.allKeys()
+
+        reloaded.setValue("filters/query", "Go")
+        reloaded.sync()
+        assert main.migrate_legacy_settings(reloaded, kept) is False
+        assert reloaded.value("filters/query") == "Go"
+        assert kept.value("filters/query") == "Python"
+
+
+def test_settings_migration_does_nothing_when_legacy_is_empty() -> None:
+    from PySide6.QtCore import QSettings
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        current = QSettings(str(root / "current.ini"), QSettings.Format.IniFormat)
+        legacy = QSettings(str(root / "legacy.ini"), QSettings.Format.IniFormat)
+        assert main.migrate_legacy_settings(current, legacy) is False
+        assert current.allKeys() == []

@@ -1,10 +1,10 @@
-# BossPilot
+# 星使 / StarEnvoy
 
 <p align="center">
-  <img src="assets/logo.png" alt="BossPilot Logo" width="240">
+  <img src="assets/logo.png" alt="星使 / StarEnvoy Logo" width="240">
 </p>
 
-基于 Python、PySide6、uv 和 DrissionPage 的 BOSS 岗位筛选工具。
+星使 / StarEnvoy 是基于 Python、PySide6、uv 和 DrissionPage 的 BOSS 岗位筛选工具。仓库：[StarDreamTech/StarEnvoy](https://github.com/StarDreamTech/StarEnvoy)。
 
 ## 开始使用
 
