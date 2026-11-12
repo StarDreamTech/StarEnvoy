@@ -1063,6 +1063,40 @@ return true;
         return "未完成（未出现沟通结果弹窗）"
 
 
+# 品牌迁移后的设置位置。旧版写在 BossPilot/BossPilot，读取时仍要兼容。
+SETTINGS_ORGANIZATION = "StarDreamTech"
+SETTINGS_APPLICATION = "StarEnvoy"
+LEGACY_SETTINGS_ORGANIZATION = "BossPilot"
+LEGACY_SETTINGS_APPLICATION = "BossPilot"
+
+
+def app_settings() -> QSettings:
+    return QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+
+
+def migrate_legacy_settings(
+    current: QSettings | None = None,
+    legacy: QSettings | None = None,
+) -> bool:
+    """新设置库为空且旧 BossPilot 库有值时，把旧值复制过去一次。
+
+    不删除旧库，方便回退版本继续读到原设置。新库只要已经有任意键，就不再覆盖。
+    """
+    if current is None:
+        current = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+    if current.allKeys():
+        return False
+    if legacy is None:
+        legacy = QSettings(LEGACY_SETTINGS_ORGANIZATION, LEGACY_SETTINGS_APPLICATION)
+    keys = legacy.allKeys()
+    if not keys:
+        return False
+    for key in keys:
+        current.setValue(key, legacy.value(key))
+    current.sync()
+    return True
+
+
 class LoginWorker(QThread):
     opened = Signal()
     failed = Signal(str)
@@ -1156,7 +1190,8 @@ class MainWindow(QMainWindow):
         self.jobs: list[Job] = []
         self.history_records: list[dict[str, object]] = []
         self._history_file_signature: tuple[int, int] | None = None
-        self.setWindowTitle("BossPilot 岗位筛选")
+        migrate_legacy_settings()
+        self.setWindowTitle("星使 / StarEnvoy 岗位筛选")
         self.setMinimumSize(980, 700)
         self.resize(1180, 790)
         self._build_ui()
@@ -1213,7 +1248,7 @@ class MainWindow(QMainWindow):
         header.addWidget(logo, 0, Qt.AlignmentFlag.AlignVCenter)
         brand = QVBoxLayout()
         brand.setSpacing(1)
-        title = QLabel("BossPilot")
+        title = QLabel("星使 / StarEnvoy")
         title.setObjectName("title")
         subtitle = QLabel("岗位采集与筛选")
         subtitle.setObjectName("subtitle")
@@ -1615,7 +1650,7 @@ class MainWindow(QMainWindow):
         button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         button.setToolTip("隐藏录屏时不想展示的字段")
         menu = QMenu(button)
-        settings = QSettings("BossPilot", "BossPilot")
+        settings = app_settings()
         saved = settings.value(f"columns/{settings_key}")
         hidden = set(self._settings_texts(saved) if saved is not None else default_hidden)
 
@@ -1854,7 +1889,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "已停止采集",
-                "已达到今日沟通上限，BossPilot 已自动停止采集。",
+                "已达到今日沟通上限，星使 / StarEnvoy 已自动停止采集。",
             )
             return
         self._set_status(f"采集完成，共匹配 {count} 个岗位。", "success")
@@ -1880,7 +1915,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def export_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出岗位", "BossPilot_jobs.csv", "CSV 文件 (*.csv)"
+            self, "导出岗位", "StarEnvoy_jobs.csv", "CSV 文件 (*.csv)"
         )
         if not path:
             return
@@ -1941,7 +1976,7 @@ class MainWindow(QMainWindow):
             for index, caption in enumerate(headers)
             if table.isColumnHidden(index)
         ]
-        settings = QSettings("BossPilot", "BossPilot")
+        settings = app_settings()
         settings.setValue(f"columns/{settings_key}", hidden)
         settings.sync()
 
@@ -2164,7 +2199,7 @@ class MainWindow(QMainWindow):
         return ()
 
     def _load_settings(self) -> None:
-        settings = QSettings("BossPilot", "BossPilot")
+        settings = app_settings()
         controls = {
             "city": self.city,
             "keyword_mode": self.keyword_mode,
@@ -2237,7 +2272,7 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
     def _save_settings(self) -> None:
-        settings = QSettings("BossPilot", "BossPilot")
+        settings = app_settings()
         values = {
             "city": self.city.currentText(),
             "query": self.query.text(),
@@ -2510,7 +2545,7 @@ def load_logo(height: int) -> QPixmap:
 
 def build_stylesheet(icon_dir: Path | None = None) -> str:
     """生成完整样式表；箭头图标写盘失败时退回平台原生箭头。"""
-    target = icon_dir or Path(QDir.tempPath()) / "bosspilot-icons"
+    target = icon_dir or Path(QDir.tempPath()) / "starenvoy-icons"
     paths: dict[str, str] = {}
     for name, (color, up) in ARROW_COLORS.items():
         points = "1,5 4.5,1.5 8,5" if up else "1,1 4.5,4.5 8,1"
@@ -2535,7 +2570,8 @@ def build_stylesheet(icon_dir: Path | None = None) -> str:
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("BossPilot")
+    app.setOrganizationName(SETTINGS_ORGANIZATION)
+    app.setApplicationName(SETTINGS_APPLICATION)
     app.setWindowIcon(QIcon(str(LOGO_PATH)))
     app.setStyleSheet(build_stylesheet())
     window = MainWindow()
