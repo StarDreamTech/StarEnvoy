@@ -1,5 +1,8 @@
 # 星使 / StarEnvoy
 
+[简体中文](README.md) | [English](README.en.md)
+
+
 <p align="center">
   <img src="assets/logo.png" alt="星使 / StarEnvoy Logo" width="240">
 </p>
